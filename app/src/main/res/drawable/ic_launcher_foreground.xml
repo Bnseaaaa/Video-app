@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- khung video -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M32,38h44a4,4 0 0 1 4,4v24a4,4 0 0 1 -4,4h-44a4,4 0 0 1 -4,-4v-24a4,4 0 0 1 4,-4z" />
+    <!-- nút play -->
+    <path android:fillColor="#6C4CF5" android:pathData="M48,45 L62,54 L48,63 Z" />
+</vector>
