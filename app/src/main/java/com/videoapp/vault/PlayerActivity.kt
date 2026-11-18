@@ -123,9 +123,9 @@ class PlayerActivity : ComponentActivity() {
         frameCache.get(ms) ?: runCatching {
             val r = retriever ?: return@runCatching null
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, PREVIEW_PX, PREVIEW_PX)
+                r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST, PREVIEW_PX, PREVIEW_PX)
             } else {
-                r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)?.let { b ->
+                r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST)?.let { b ->
                     val s = PREVIEW_PX.toFloat() / maxOf(b.width, b.height)
                     if (s < 1f) Bitmap.createScaledBitmap(b, (b.width * s).toInt().coerceAtLeast(1), (b.height * s).toInt().coerceAtLeast(1), true) else b
                 }
