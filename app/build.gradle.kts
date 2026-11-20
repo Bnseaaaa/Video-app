@@ -12,8 +12,8 @@ android {
         applicationId = "com.videoapp.vault"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.7"
+        versionCode = 9
+        versionName = "1.8"
     }
 
     // Chỉ giữ ngôn ngữ tiếng Việt và tiếng Anh trong tài nguyên của thư viện

@@ -4,15 +4,19 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.provider.Settings
 import android.text.format.DateFormat
 import android.text.format.Formatter
 import android.util.LruCache
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.result.IntentSenderRequest
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -71,7 +75,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -201,21 +204,65 @@ private fun LibraryScreen(vm: LibraryViewModel) {
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
     var access by remember { mutableStateOf(currentAccess(context)) }
+    val prefs = remember { context.getSharedPreferences("kho_video", Context.MODE_PRIVATE) }
     var query by rememberSaveable { mutableStateOf("") }          // tìm ở màn hình chính (toàn máy)
     var folderQuery by rememberSaveable { mutableStateOf("") }    // tìm trong thư mục đang mở
     var sort by rememberSaveable { mutableStateOf(SortMode.NEWEST) }
     var folderSort by rememberSaveable { mutableStateOf(FolderSort.RECENT) }
     var openFolder by rememberSaveable { mutableStateOf<String?>(null) }
-    var gridMode by rememberSaveable { mutableStateOf(true) }
+    var gridMode by rememberSaveable { mutableStateOf(prefs.getBoolean("video_grid_mode", false)) }
+    var showWidgets by rememberSaveable { mutableStateOf(prefs.getBoolean("show_widgets", true)) }
+    var selectionMode by rememberSaveable { mutableStateOf(false) }
+    var selectedIds by rememberSaveable { mutableStateOf(setOf<String>()) }
+    var singleDeleteFor by remember { mutableStateOf<VideoItem?>(null) }
+    var confirmDeleteMulti by remember { mutableStateOf(false) }
     var sheetFor by remember { mutableStateOf<VideoItem?>(null) }
     var renameFor by remember { mutableStateOf<VideoItem?>(null) }
     var deleteLegacyFor by remember { mutableStateOf<VideoItem?>(null) }
     var pendingExport by remember { mutableStateOf<VideoItem?>(null) }
-    val prefs = remember { context.getSharedPreferences("kho_video", Context.MODE_PRIVATE) }
     val homeGrid = rememberLazyGridState()
     val streak by StreakStore.state.collectAsStateWithLifecycle()
     var streakOpen by rememberSaveable { mutableStateOf(false) }
     var streakMsgs by remember { mutableStateOf(emptyList<String>()) }
+
+    val deleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+        if (res.resultCode == Activity.RESULT_OK) {
+            vm.refresh()
+        }
+    }
+
+    fun deleteVideos(items: List<VideoItem>) {
+        if (items.isEmpty()) return
+        val legacy = items.filter { it.localFile != null }
+        val media = items.filter { it.localFile == null }
+        legacy.forEach { vm.deleteLegacy(it) }
+        if (media.isEmpty()) {
+            vm.refresh()
+            return
+        }
+        val uris = media.map { it.uri }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val pi = MediaStore.createDeleteRequest(context.contentResolver, uris)
+            deleteLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+        } else {
+            var recoverable: IntentSender? = null
+            for (m in media) {
+                try {
+                    context.contentResolver.delete(m.uri, null, null)
+                } catch (e: SecurityException) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && e is android.app.RecoverableSecurityException) {
+                        recoverable = e.userAction.actionIntent.intentSender
+                        break
+                    }
+                } catch (_: Exception) {}
+            }
+            if (recoverable != null) {
+                deleteLauncher.launch(IntentSenderRequest.Builder(recoverable).build())
+            } else {
+                vm.refresh()
+            }
+        }
+    }
     // Tự mở bảng chuỗi lửa (một lần cho mỗi lần đứt chuỗi) để hỏi có dùng lửa xanh không
     var gapShown by rememberSaveable { mutableLongStateOf(Long.MIN_VALUE) }
     LaunchedEffect(streak.gap?.firstDay) {
@@ -287,8 +334,15 @@ private fun LibraryScreen(vm: LibraryViewModel) {
     LaunchedEffect(openFolder, current, state.loading) {
         if (openFolder != null && current == null && !state.loading) openFolder = null
     }
-    val closeFolder = { openFolder = null; folderQuery = "" }
-    BackHandler(enabled = openFolder != null) { closeFolder() }
+    val closeFolder = { openFolder = null; folderQuery = ""; selectionMode = false; selectedIds = emptySet() }
+    BackHandler(enabled = selectionMode || openFolder != null) {
+        if (selectionMode) {
+            selectionMode = false
+            selectedIds = emptySet()
+        } else {
+            closeFolder()
+        }
+    }
 
     val searching = query.isNotBlank()
     val searchResults = remember(state.videos, query, sort) {
@@ -315,9 +369,31 @@ private fun LibraryScreen(vm: LibraryViewModel) {
 
     @Composable
     fun VideoItemCell(item: VideoItem, modifier: Modifier) {
-        val play = { play(item) }
-        val more = { sheetFor = item }
-        Box(modifier) { if (gridMode) VideoTile(item, play, more) else VideoRow(item, play, more) }
+        val isSelected = item.id in selectedIds
+        val onToggleSelect = {
+            selectedIds = if (isSelected) selectedIds - item.id else selectedIds + item.id
+        }
+        val onClick = {
+            if (selectionMode) onToggleSelect() else play(item)
+        }
+        val onLongClick = {
+            if (!selectionMode) {
+                selectionMode = true
+                selectedIds = setOf(item.id)
+            } else {
+                onToggleSelect()
+            }
+        }
+        val onMore = {
+            if (selectionMode) onToggleSelect() else sheetFor = item
+        }
+        Box(modifier) {
+            if (gridMode) {
+                VideoTile(item, onClick, onLongClick, onMore, selectionMode, isSelected)
+            } else {
+                VideoRow(item, onClick, onLongClick, onMore, selectionMode, isSelected)
+            }
+        }
     }
 
     CompositionLocalProvider(LocalRepo provides vm.repo) {
@@ -352,14 +428,34 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                     ) {
                         val hasVideos = state.videos.isNotEmpty()
                         fullLine("header") {
-                            if (searching) {
+                            if (selectionMode && searching) {
+                                SelectionHeader(
+                                    selectedCount = selectedIds.size,
+                                    totalCount = searchResults.size,
+                                    onClose = { selectionMode = false; selectedIds = emptySet() },
+                                    onSelectAll = {
+                                        val allSelected = searchResults.isNotEmpty() && searchResults.all { it.id in selectedIds }
+                                        selectedIds = if (allSelected) selectedIds - searchResults.map { it.id }.toSet()
+                                        else selectedIds + searchResults.map { it.id }.toSet()
+                                    },
+                                    onDelete = { confirmDeleteMulti = true },
+                                )
+                            } else if (searching) {
                                 Header(
                                     title = "Kho Video",
                                     subtitle = "Kết quả tìm kiếm",
                                     showActions = true,
                                     sortOptions = SortMode.entries.map { it.label }, selectedSort = sort.ordinal,
                                     onSort = { sort = SortMode.entries[it] },
-                                    gridMode = gridMode, onToggle = { gridMode = !gridMode },
+                                    gridMode = gridMode,
+                                    onToggle = {
+                                        gridMode = !gridMode
+                                        prefs.edit().putBoolean("video_grid_mode", gridMode).apply()
+                                    },
+                                    showWidgets = showWidgets,
+                                    onSelectMode = if (searchResults.isNotEmpty()) {
+                                        { selectionMode = true }
+                                    } else null,
                                 )
                             } else {
                                 Header(
@@ -368,7 +464,18 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                     showActions = hasVideos,
                                     sortOptions = FolderSort.entries.map { it.label }, selectedSort = folderSort.ordinal,
                                     onSort = { folderSort = FolderSort.entries[it] },
-                                    gridMode = gridMode, onToggle = { gridMode = !gridMode },
+                                    gridMode = gridMode,
+                                    onToggle = {
+                                        gridMode = !gridMode
+                                        prefs.edit().putBoolean("video_grid_mode", gridMode).apply()
+                                    },
+                                    showWidgets = showWidgets,
+                                    onToggleWidgets = if (hasVideos) {
+                                        {
+                                            showWidgets = !showWidgets
+                                            prefs.edit().putBoolean("show_widgets", showWidgets).apply()
+                                        }
+                                    } else null,
                                 )
                             }
                         }
@@ -376,13 +483,13 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                             fullLine("perm") { PermissionPrompt(onAllow = requestAccess) }
                             return@LazyVerticalGrid
                         }
-                        if (!searching) fullLine("streak") { StreakCard(streak) { streakOpen = true } }
+                        if (!searching && showWidgets) fullLine("streak") { StreakCard(streak) { streakOpen = true } }
                         if (access == Access.PARTIAL) {
                             fullLine("partial") { PartialAccessBanner(onAllowAll = requestAccess) }
                         }
                         if (hasVideos) {
-                            fullLine("stats") { StatsCard(visible, folders.size) }
-                            if (!searching) {
+                            if (showWidgets) fullLine("stats") { StatsCard(visible, folders.size) }
+                            if (!searching && showWidgets) {
                                 fullLine("gacha") {
                                     GachaCard(visible, scopeLabel = "toàn bộ máy") { gachaScope = GACHA_ALL }
                                 }
@@ -425,15 +532,41 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                         verticalArrangement = Arrangement.spacedBy(if (gridMode) 14.dp else 10.dp),
                     ) {
                         fullLine("header") {
-                            Header(
-                                title = folder.name,
-                                subtitle = "${folder.count} video · ${Formatter.formatShortFileSize(context, folder.size)}",
-                                onBack = closeFolder,
-                                showActions = true,
-                                sortOptions = SortMode.entries.map { it.label }, selectedSort = sort.ordinal,
-                                onSort = { sort = SortMode.entries[it] },
-                                gridMode = gridMode, onToggle = { gridMode = !gridMode },
-                            )
+                            if (selectionMode) {
+                                SelectionHeader(
+                                    selectedCount = selectedIds.size,
+                                    totalCount = folderVideos.size,
+                                    onClose = { selectionMode = false; selectedIds = emptySet() },
+                                    onSelectAll = {
+                                        val allSelected = folderVideos.isNotEmpty() && folderVideos.all { it.id in selectedIds }
+                                        selectedIds = if (allSelected) selectedIds - folderVideos.map { it.id }.toSet()
+                                        else selectedIds + folderVideos.map { it.id }.toSet()
+                                    },
+                                    onDelete = { confirmDeleteMulti = true },
+                                )
+                            } else {
+                                Header(
+                                    title = folder.name,
+                                    subtitle = "${folder.count} video · ${Formatter.formatShortFileSize(context, folder.size)}",
+                                    onBack = closeFolder,
+                                    showActions = true,
+                                    sortOptions = SortMode.entries.map { it.label }, selectedSort = sort.ordinal,
+                                    onSort = { sort = SortMode.entries[it] },
+                                    gridMode = gridMode,
+                                    onToggle = {
+                                        gridMode = !gridMode
+                                        prefs.edit().putBoolean("video_grid_mode", gridMode).apply()
+                                    },
+                                    showWidgets = showWidgets,
+                                    onToggleWidgets = {
+                                        showWidgets = !showWidgets
+                                        prefs.edit().putBoolean("show_widgets", showWidgets).apply()
+                                    },
+                                    onSelectMode = if (folderVideos.isNotEmpty()) {
+                                        { selectionMode = true }
+                                    } else null,
+                                )
+                            }
                         }
                         folder.path?.let { p ->
                             fullLine("path") {
@@ -444,8 +577,10 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                 }
                             }
                         }
-                        fullLine("gacha") {
-                            GachaCard(folder.videos, scopeLabel = "thư mục này", compact = true) { gachaScope = folder.key }
+                        if (showWidgets) {
+                            fullLine("gacha") {
+                                GachaCard(folder.videos, scopeLabel = "thư mục này", compact = true) { gachaScope = folder.key }
+                            }
                         }
                         fullLine("search") { SearchField(folderQuery, "Tìm trong ${folder.name}") { folderQuery = it } }
                         if (folderVideos.isEmpty()) fullLine("nores") { NoResults(folderQuery) }
@@ -480,12 +615,53 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                 onDismiss = { sheetFor = null },
                 onPlay = { play(item) },
                 onRename = { renameFor = item },
-                onShare = { shareVideo(context, item) },
+                onDelete = { singleDeleteFor = item },
                 onToggleHidden = { vm.setHidden(item, !item.hidden) },
                 onExport = { export(item) },
                 onDeleteLegacy = { deleteLegacyFor = item },
             )
         }
+    }
+
+    if (confirmDeleteMulti) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteMulti = false },
+            icon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Xoá ${selectedIds.size} video đã chọn?") },
+            text = { Text("Các video này sẽ bị xoá vĩnh viễn khỏi thiết bị.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val toDelete = state.videos.filter { it.id in selectedIds }
+                        deleteVideos(toDelete)
+                        confirmDeleteMulti = false
+                        selectionMode = false
+                        selectedIds = emptySet()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                ) { Text("Xoá") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteMulti = false }) { Text("Huỷ") } },
+        )
+    }
+
+    singleDeleteFor?.let { item ->
+        AlertDialog(
+            onDismissRequest = { singleDeleteFor = null },
+            icon = { Icon(Icons.Rounded.DeleteOutline, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Xoá video này?") },
+            text = { Text("\"${item.name}\" sẽ bị xoá vĩnh viễn khỏi thiết bị.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        deleteVideos(listOf(item))
+                        singleDeleteFor = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                ) { Text("Xoá") }
+            },
+            dismissButton = { TextButton(onClick = { singleDeleteFor = null }) { Text("Huỷ") } },
+        )
     }
 
     renameFor?.let { item ->
@@ -538,14 +714,47 @@ internal fun LazyGridScope.fullLine(key: String, content: @Composable () -> Unit
     item(key = key, span = { GridItemSpan(maxLineSpan) }) { content() }
 }
 
-private fun shareVideo(context: Context, item: VideoItem) {
-    val uri = item.localFile?.let { FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", it) }
-        ?: item.uri
-    val send = Intent(Intent.ACTION_SEND)
-        .setType(item.mime ?: "video/*")
-        .putExtra(Intent.EXTRA_STREAM, uri)
-        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    context.startActivity(Intent.createChooser(send, "Chia sẻ video"))
+@Composable
+private fun SelectionHeader(
+    selectedCount: Int,
+    totalCount: Int,
+    onClose: () -> Unit,
+    onSelectAll: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onClose) {
+            Icon(Icons.Rounded.Close, "Huỷ chọn")
+        }
+        Text(
+            "Đã chọn $selectedCount",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.weight(1f).padding(start = 4.dp),
+        )
+        TextButton(onClick = onSelectAll) {
+            Text(if (selectedCount == totalCount && totalCount > 0) "Bỏ chọn" else "Tất cả")
+        }
+        FilledTonalIconButton(
+            onClick = onDelete,
+            enabled = selectedCount > 0,
+            colors = IconButtonDefaults.filledTonalIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                disabledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+            ),
+        ) {
+            Icon(Icons.Rounded.DeleteOutline, "Xoá đã chọn")
+        }
+    }
 }
 
 // ───────────────────────────── Phần đầu trang ─────────────────────────────
@@ -563,6 +772,9 @@ internal fun Header(
     onBack: (() -> Unit)? = null,
     /** Nút thêm ở đầu nhóm nút bên phải (vd nút chọn thư mục của mục Ảnh). */
     extraAction: (@Composable () -> Unit)? = null,
+    showWidgets: Boolean = true,
+    onToggleWidgets: (() -> Unit)? = null,
+    onSelectMode: (() -> Unit)? = null,
 ) {
     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         if (onBack != null) {
@@ -588,6 +800,21 @@ internal fun Header(
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
                 contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
             )
+            if (onSelectMode != null) {
+                FilledTonalIconButton(onClick = onSelectMode, colors = colors) {
+                    Icon(Icons.Rounded.Checklist, "Chọn video")
+                }
+                Spacer(Modifier.width(8.dp))
+            }
+            if (onToggleWidgets != null) {
+                FilledTonalIconButton(onClick = onToggleWidgets, colors = colors) {
+                    Icon(
+                        if (showWidgets) Icons.Rounded.DashboardCustomize else Icons.Rounded.Dashboard,
+                        if (showWidgets) "Ẩn tiện ích" else "Hiện tiện ích",
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+            }
             Box {
                 var open by remember { mutableStateOf(false) }
                 FilledTonalIconButton(onClick = { open = true }, colors = colors) {
@@ -872,7 +1099,14 @@ internal fun folderIcon(name: String): ImageVector = when (name.lowercase()) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VideoTile(item: VideoItem, onClick: () -> Unit, onMore: () -> Unit) {
+private fun VideoTile(
+    item: VideoItem,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onMore: () -> Unit,
+    selectionMode: Boolean = false,
+    selected: Boolean = false,
+) {
     val context = LocalContext.current
     Box(
         Modifier
@@ -880,7 +1114,7 @@ private fun VideoTile(item: VideoItem, onClick: () -> Unit, onMore: () -> Unit) 
             .aspectRatio(0.82f)
             .clip(MaterialTheme.shapes.medium)
             .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-            .combinedClickable(onClick = onClick, onLongClick = onMore),
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
         Thumbnail(item, Modifier.fillMaxSize())
         // lớp phủ tối để chữ dễ đọc
@@ -901,27 +1135,43 @@ private fun VideoTile(item: VideoItem, onClick: () -> Unit, onMore: () -> Unit) 
             if (item.hidden) HiddenBadge()
             if (item.watched) WatchedBadge()
         }
-        Box(
-            Modifier
-                .align(Alignment.TopEnd)
-                .padding(6.dp)
-                .size(34.dp)
-                .clip(CircleShape)
-                .background(Color.Black.copy(alpha = 0.35f))
-                .clickable(onClick = onMore),
-            Alignment.Center,
-        ) {
-            Icon(Icons.Rounded.MoreHoriz, "Tuỳ chọn", tint = Color.White, modifier = Modifier.size(20.dp))
-        }
-        Box(
-            Modifier
-                .align(Alignment.Center)
-                .size(46.dp)
-                .clip(CircleShape)
-                .background(Color.White.copy(alpha = 0.25f)),
-            Alignment.Center,
-        ) {
-            Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(28.dp))
+        if (selectionMode) {
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(if (selected) MaterialTheme.colorScheme.primary else Color.Black.copy(alpha = 0.6f)),
+                Alignment.Center,
+            ) {
+                if (selected) {
+                    Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(18.dp))
+                }
+            }
+        } else {
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp)
+                    .size(34.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.35f))
+                    .clickable(onClick = onMore),
+                Alignment.Center,
+            ) {
+                Icon(Icons.Rounded.MoreHoriz, "Tuỳ chọn", tint = Color.White, modifier = Modifier.size(20.dp))
+            }
+            Box(
+                Modifier
+                    .align(Alignment.Center)
+                    .size(46.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.25f)),
+                Alignment.Center,
+            ) {
+                Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(28.dp))
+            }
         }
         Column(Modifier.align(Alignment.BottomStart).padding(12.dp)) {
             Text(item.name, color = Color.White, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -938,14 +1188,21 @@ private fun VideoTile(item: VideoItem, onClick: () -> Unit, onMore: () -> Unit) 
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VideoRow(item: VideoItem, onClick: () -> Unit, onMore: () -> Unit) {
+private fun VideoRow(
+    item: VideoItem,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onMore: () -> Unit,
+    selectionMode: Boolean = false,
+    selected: Boolean = false,
+) {
     val context = LocalContext.current
     Row(
         Modifier
             .fillMaxWidth()
             .clip(MaterialTheme.shapes.medium)
-            .background(MaterialTheme.colorScheme.surfaceContainerLow)
-            .combinedClickable(onClick = onClick, onLongClick = onMore)
+            .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surfaceContainerLow)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -980,7 +1237,22 @@ private fun VideoRow(item: VideoItem, onClick: () -> Unit, onMore: () -> Unit) {
                 if (item.watched) { Spacer(Modifier.width(6.dp)); WatchedBadge() }
             }
         }
-        IconButton(onClick = onMore) { Icon(Icons.Rounded.MoreVert, "Tuỳ chọn") }
+        if (selectionMode) {
+            Box(
+                Modifier
+                    .padding(end = 8.dp)
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest),
+                Alignment.Center,
+            ) {
+                if (selected) {
+                    Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(18.dp))
+                }
+            }
+        } else {
+            IconButton(onClick = onMore) { Icon(Icons.Rounded.MoreVert, "Tuỳ chọn") }
+        }
     }
 }
 
@@ -1100,7 +1372,7 @@ private fun ActionSheet(
     onDismiss: () -> Unit,
     onPlay: () -> Unit,
     onRename: () -> Unit,
-    onShare: () -> Unit,
+    onDelete: () -> Unit,
     onToggleHidden: () -> Unit,
     onExport: () -> Unit,
     onDeleteLegacy: () -> Unit,
@@ -1138,15 +1410,16 @@ private fun ActionSheet(
             val act = { f: () -> Unit -> { onDismiss(); f() } }
             SheetAction(Icons.Rounded.PlayArrow, "Phát video", onClick = act(onPlay))
             SheetAction(Icons.Rounded.Edit, "Đổi tên", "Chỉ đổi tên trong app, file gốc giữ nguyên", onClick = act(onRename))
-            SheetAction(Icons.Rounded.Share, "Chia sẻ", onClick = act(onShare))
+            if (item.localFile != null) {
+                SheetAction(Icons.Rounded.SaveAlt, "Lưu ra Thư viện", "Bản sao trong Movies/KhoVideo", onClick = act(onExport))
+                SheetAction(Icons.Rounded.DeleteOutline, "Xoá bản chép", "Bản chép trong app từ phiên bản 1.0", danger = true, onClick = act(onDeleteLegacy))
+            } else {
+                SheetAction(Icons.Rounded.DeleteOutline, "Xoá video", "Xoá vĩnh viễn khỏi thiết bị", danger = true, onClick = act(onDelete))
+            }
             if (item.hidden) {
                 SheetAction(Icons.Rounded.Visibility, "Bỏ ẩn", "Hiện lại video trong danh sách", onClick = act(onToggleHidden))
             } else {
                 SheetAction(Icons.Rounded.VisibilityOff, "Ẩn khỏi danh sách", "Video trong máy vẫn giữ nguyên", onClick = act(onToggleHidden))
-            }
-            if (item.localFile != null) {
-                SheetAction(Icons.Rounded.SaveAlt, "Lưu ra Thư viện", "Bản sao trong Movies/KhoVideo", onClick = act(onExport))
-                SheetAction(Icons.Rounded.DeleteOutline, "Xoá bản chép", "Bản chép trong app từ phiên bản 1.0", danger = true, onClick = act(onDeleteLegacy))
             }
         }
     }

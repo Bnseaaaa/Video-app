@@ -59,6 +59,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -92,6 +93,27 @@ class PlayerActivity : ComponentActivity() {
 
     private var queue: List<VideoItem> = emptyList()
     private var index by mutableIntStateOf(0)
+    private var resumeFlash by mutableStateOf<String?>(null)
+
+    private fun currentItemKey(): String? =
+        queue.getOrNull(index)?.id?.ifEmpty { null } ?: queue.getOrNull(index)?.uri?.toString()
+
+    private fun getResumePosition(key: String?): Long {
+        if (key == null) return 0L
+        val prefs = getSharedPreferences("kho_video", Context.MODE_PRIVATE)
+        return prefs.getLong("playback_pos_$key", 0L)
+    }
+
+    private fun savePlaybackPosition(key: String?, pos: Long, dur: Long) {
+        if (key == null) return
+        val prefs = getSharedPreferences("kho_video", Context.MODE_PRIVATE)
+        // Lưu nếu đã xem qua 2 giây và chưa đến sát cuối (còn hơn 3s)
+        if (pos > 2_000L && dur > 5_000L && pos < dur - 3_000L) {
+            prefs.edit().putLong("playback_pos_$key", pos).apply()
+        } else if (pos >= dur - 3_000L || dur <= 5_000L) {
+            prefs.edit().remove("playback_pos_$key").apply()
+        }
+    }
 
     // Trạng thái hiển thị cho giao diện
     private var isPlaying by mutableStateOf(false)
@@ -166,6 +188,10 @@ class PlayerActivity : ComponentActivity() {
         override fun onPlaybackStateChanged(state: Int) {
             buffering = state == Player.STATE_BUFFERING
             ended = state == Player.STATE_ENDED
+            if (state == Player.STATE_ENDED) {
+                val dur = player?.duration ?: 0L
+                savePlaybackPosition(currentItemKey(), dur, dur)
+            }
         }
 
         override fun onPlayerError(e: PlaybackException) {
@@ -248,6 +274,7 @@ class PlayerActivity : ComponentActivity() {
         player?.let {
             position = it.currentPosition
             playWhenReady = it.playWhenReady
+            savePlaybackPosition(currentItemKey(), position, it.duration)
             it.removeListener(listener)
             it.release()
         }
@@ -267,8 +294,13 @@ class PlayerActivity : ComponentActivity() {
         val p = player ?: return
         error = null
         ended = false
+        val key = currentItemKey()
+        val resumePos = if (startAt > 0) startAt else getResumePosition(key)
+        if (resumePos > 0 && startAt == 0L) {
+            resumeFlash = "Tiếp tục từ ${formatDuration(resumePos)}"
+        }
         p.setMediaItem(MediaItem.fromUri(queue[index].uri))
-        p.seekTo(startAt)
+        p.seekTo(resumePos)
         p.playWhenReady = play
         p.prepare()
     }
@@ -277,6 +309,7 @@ class PlayerActivity : ComponentActivity() {
     private fun go(delta: Int) {
         val n = index + delta
         if (n !in queue.indices) return
+        player?.let { savePlaybackPosition(currentItemKey(), it.currentPosition, it.duration) }
         flushWatch()
         index = n
         VideoRepository(this).markWatched(queue[n])
@@ -322,6 +355,18 @@ class PlayerActivity : ComponentActivity() {
         var flash by remember { mutableStateOf<String?>(null) }  // chữ "« 5 giây" / "5 giây »" ở giữa màn hình
         var fast by remember { mutableStateOf(false) }  // đang giữ màn hình để tua nhanh
         var preview by remember { mutableStateOf<ImageBitmap?>(null) }  // khung hình xem trước khi kéo thanh tua
+        var isSwiping by remember { mutableStateOf(false) }
+        var swipeTargetPos by remember { mutableLongStateOf(0L) }
+        var swipeDeltaSec by remember { mutableLongStateOf(0L) }
+        var screenWidth by remember { mutableIntStateOf(1) }
+
+        LaunchedEffect(resumeFlash) {
+            val msg = resumeFlash
+            if (msg != null) {
+                flash = msg
+                resumeFlash = null
+            }
+        }
         // Khi kéo: lấy khung hình ở vị trí đang kéo tới (làm tròn theo giây); kéo nhanh thì bỏ qua các vị trí cũ
         LaunchedEffect(Unit) {
             snapshotFlow { seeking?.let { (it * dur).toLong() / 1000 * 1000 } }
@@ -364,35 +409,126 @@ class PlayerActivity : ComponentActivity() {
         }
         val act = { block: () -> Unit -> touched++; block() }
 
-        Box(Modifier.fillMaxSize().background(Color.Black)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .onSizeChanged { screenWidth = it.width }
+        ) {
             AndroidView({ playerView }, Modifier.fillMaxSize())
-            // Chạm vào video để ẩn/hiện thanh điều khiển; giữ ngón tay để tua nhanh x2, thả ra về bình thường
+            // Vuốt ngang màn hình để tua live trên màn hình lớn; chạm/nhấp đúp 5s/giữ 2x
             Box(
-                Modifier.fillMaxSize().pointerInput(locked) {
-                    detectTapGestures(
-                        onTap = { if (locked) showUnlock = !showUnlock else controls = !controls },
-                        onLongPress = {
-                            val pl = player
-                            if (!locked && pl != null && !ended && error == null) {
-                                wasPlayingBeforeFast = pl.playWhenReady
-                                pl.setPlaybackSpeed(FAST_SPEED)
-                                pl.play()
-                                fast = true
-                            }
-                        },
-                        onPress = {
-                            tryAwaitRelease()
-                            if (fast) {
-                                fast = false
-                                player?.let { pl ->
-                                    pl.setPlaybackSpeed(1f)
-                                    if (!wasPlayingBeforeFast) pl.pause()
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(locked) {
+                        if (locked) return@pointerInput
+                        var totalDragX = 0f
+                        var startPos = 0L
+                        detectHorizontalDragGestures(
+                            onDragStart = {
+                                val pl = player ?: return@detectHorizontalDragGestures
+                                totalDragX = 0f
+                                startPos = pl.currentPosition
+                                isSwiping = true
+                                swipeTargetPos = startPos
+                                swipeDeltaSec = 0L
+                                pl.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                            },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                totalDragX += dragAmount
+                                val pl = player ?: return@detectHorizontalDragGestures
+                                val range = dur.coerceIn(30_000L, 180_000L)
+                                val deltaMs = (totalDragX / screenWidth.coerceAtLeast(1)) * range
+                                val target = (startPos + deltaMs.toLong()).coerceIn(0L, dur)
+                                swipeTargetPos = target
+                                swipeDeltaSec = (target - startPos) / 1000
+                                pl.seekTo(target)
+                                pos = target
+                            },
+                            onDragEnd = {
+                                isSwiping = false
+                                player?.setSeekParameters(SeekParameters.EXACT)
+                                player?.seekTo(swipeTargetPos)
+                                pos = swipeTargetPos
+                                touched++
+                            },
+                            onDragCancel = {
+                                isSwiping = false
+                                player?.setSeekParameters(SeekParameters.EXACT)
+                            },
+                        )
+                    }
+                    .pointerInput(locked) {
+                        detectTapGestures(
+                            onTap = { if (locked) showUnlock = !showUnlock else controls = !controls },
+                            onDoubleTap = { offset ->
+                                if (!locked && player != null && !ended && error == null) {
+                                    val isRight = offset.x >= screenWidth / 2
+                                    val delta = if (isRight) 5_000L else -5_000L
+                                    seekBy(delta)
+                                    flash = if (isRight) "5 giây »" else "« 5 giây"
+                                    touched++
                                 }
-                            }
-                        },
-                    )
-                },
+                            },
+                            onLongPress = {
+                                val pl = player
+                                if (!locked && pl != null && !ended && error == null && !isSwiping) {
+                                    wasPlayingBeforeFast = pl.playWhenReady
+                                    pl.setPlaybackSpeed(FAST_SPEED)
+                                    pl.play()
+                                    fast = true
+                                }
+                            },
+                            onPress = {
+                                tryAwaitRelease()
+                                if (fast) {
+                                    fast = false
+                                    player?.let { pl ->
+                                        pl.setPlaybackSpeed(1f)
+                                        if (!wasPlayingBeforeFast) pl.pause()
+                                    }
+                                }
+                            },
+                        )
+                    },
             )
+
+            // Khung hiển thị khi vuốt trên màn hình để tua
+            AnimatedVisibility(
+                isSwiping,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.Center),
+            ) {
+                Column(
+                    Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color.Black.copy(alpha = 0.75f))
+                        .padding(horizontal = 24.dp, vertical = 14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    val sign = if (swipeDeltaSec >= 0) "+" else ""
+                    Icon(
+                        if (swipeDeltaSec >= 0) Icons.Rounded.FastForward else Icons.Rounded.FastRewind,
+                        null,
+                        tint = Color.White,
+                        modifier = Modifier.size(36.dp),
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "${formatDuration(swipeTargetPos)} / ${formatDuration(dur)}",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        "[$sign${swipeDeltaSec}s]",
+                        color = Color.White.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
             // Nhãn "Tua nhanh 2x" khi đang giữ
             AnimatedVisibility(
                 fast, enter = fadeIn(), exit = fadeOut(),

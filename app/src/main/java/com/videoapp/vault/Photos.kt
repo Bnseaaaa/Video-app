@@ -71,6 +71,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
 import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
@@ -702,16 +703,31 @@ private fun PhotoViewer(photos: List<PhotoItem>, start: Int, onDismiss: () -> Un
         var chrome by remember { mutableStateOf(true) }
         var infoFor by remember { mutableStateOf<PhotoItem?>(null) }
         val currentPhoto = photos.getOrNull(pager.currentPage)
+        var locked by rememberSaveable { mutableStateOf(false) }
+        var showUnlock by remember { mutableStateOf(false) }
+        var autoPlay by rememberSaveable { mutableStateOf(false) }
+
+        // Tự chuyển ảnh mỗi 3 giây nếu bật và không bị khoá
+        LaunchedEffect(autoPlay, locked, pager.currentPage) {
+            if (autoPlay && !locked && photos.size > 1) {
+                delay(3000L)
+                val next = (pager.currentPage + 1) % photos.size
+                pager.animateScrollToPage(next)
+            }
+        }
+        LaunchedEffect(showUnlock) {
+            if (showUnlock) { delay(2500); showUnlock = false }
+        }
 
         // Ẩn thanh trạng thái khi ẩn thanh công cụ, để xem ảnh trọn màn hình
         val view = LocalView.current
-        LaunchedEffect(chrome) {
+        LaunchedEffect(chrome, locked) {
             val window = (view.parent as? DialogWindowProvider)?.window ?: return@LaunchedEffect
             WindowCompat.getInsetsController(window, view).apply {
                 isAppearanceLightStatusBars = false
                 isAppearanceLightNavigationBars = false
                 systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                if (chrome) show(WindowInsetsCompat.Type.systemBars()) else hide(WindowInsetsCompat.Type.systemBars())
+                if (chrome && !locked) show(WindowInsetsCompat.Type.systemBars()) else hide(WindowInsetsCompat.Type.systemBars())
             }
         }
 
@@ -719,13 +735,17 @@ private fun PhotoViewer(photos: List<PhotoItem>, start: Int, onDismiss: () -> Un
             HorizontalPager(
                 state = pager,
                 modifier = Modifier.fillMaxSize(),
+                userScrollEnabled = !locked, // Khi khoá ảnh: không cho vuốt sang ảnh khác
                 beyondViewportPageCount = 1,
                 key = { photos[it].id },
             ) { page ->
-                FullPhoto(photos[page], onTap = { chrome = !chrome })
+                FullPhoto(photos[page], onTap = {
+                    if (locked) showUnlock = !showUnlock
+                    else chrome = !chrome
+                })
             }
 
-            AnimatedVisibility(chrome, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter)) {
+            AnimatedVisibility(chrome && !locked, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter)) {
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -749,10 +769,26 @@ private fun PhotoViewer(photos: List<PhotoItem>, start: Int, onDismiss: () -> Un
                             style = MaterialTheme.typography.labelMedium,
                         )
                     }
+                    if (autoPlay) {
+                        Surface(
+                            shape = CircleShape,
+                            color = Color.Black.copy(alpha = 0.5f),
+                            modifier = Modifier.padding(end = 12.dp)
+                        ) {
+                            Row(
+                                Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Rounded.PlayCircle, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Tự chuyển 3s", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
                 }
             }
 
-            AnimatedVisibility(chrome, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.BottomCenter)) {
+            AnimatedVisibility(chrome && !locked, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.BottomCenter)) {
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -761,9 +797,43 @@ private fun PhotoViewer(photos: List<PhotoItem>, start: Int, onDismiss: () -> Un
                         .padding(vertical = 10.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                 ) {
-                    ViewerAction(Icons.Rounded.Share, "Chia sẻ") { currentPhoto?.let { sharePhoto(context, it) } }
+                    ViewerAction(
+                        if (autoPlay) Icons.Rounded.PauseCircle else Icons.Rounded.PlayCircle,
+                        if (autoPlay) "Dừng tự chuyển" else "Tự chuyển ảnh"
+                    ) {
+                        autoPlay = !autoPlay
+                    }
+                    ViewerAction(Icons.Rounded.Lock, "Khoá ảnh") {
+                        locked = true
+                        showUnlock = true
+                        autoPlay = false
+                    }
                     ViewerAction(Icons.AutoMirrored.Rounded.OpenInNew, "Mở bằng...") { currentPhoto?.let { openPhotoWith(context, it) } }
                     ViewerAction(Icons.Rounded.Info, "Thông tin") { infoFor = currentPhoto }
+                }
+            }
+
+            // Đang khoá ảnh: hiển thị nút mở khoá khi chạm vào ảnh
+            AnimatedVisibility(
+                locked && showUnlock,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 28.dp),
+            ) {
+                Row(
+                    Modifier
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.7f))
+                        .clickable { locked = false; showUnlock = false; chrome = true }
+                        .padding(horizontal = 18.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Rounded.LockOpen, null, tint = Color.White)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Chạm để mở khoá ảnh", color = Color.White, style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -910,14 +980,6 @@ private fun PhotoInfo(item: PhotoItem, onDismiss: () -> Unit) {
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Đóng") } },
     )
-}
-
-private fun sharePhoto(context: Context, item: PhotoItem) {
-    val send = Intent(Intent.ACTION_SEND)
-        .setType(item.mime ?: "image/*")
-        .putExtra(Intent.EXTRA_STREAM, item.uri)
-        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    context.startActivity(Intent.createChooser(send, "Chia sẻ ảnh"))
 }
 
 /** Mở ảnh bằng app khác (vd để chỉnh sửa trong Thư viện ảnh của máy). */

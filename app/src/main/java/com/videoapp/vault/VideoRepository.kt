@@ -89,9 +89,10 @@ class VideoRepository(private val context: Context) {
             MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
             MediaStore.Video.Media.MIME_TYPE,
             pathCol,
+            MediaStore.Video.Media.DATE_MODIFIED,
         )
         runCatching {
-            resolver.query(collection, projection, null, null, "${MediaStore.Video.Media.DATE_ADDED} DESC")
+            resolver.query(collection, projection, null, null, "${MediaStore.Video.Media.DATE_MODIFIED} DESC, ${MediaStore.Video.Media.DATE_ADDED} DESC")
         }.getOrNull()?.use { c ->
             while (c.moveToNext()) {
                 val mediaId = c.getLong(0)
@@ -100,13 +101,16 @@ class VideoRepository(private val context: Context) {
                 val rawPath = c.getString(7)
                 val path = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) rawPath
                 else rawPath?.substringBeforeLast('/')?.substringAfter("/storage/emulated/0/")
+                val dateAdded = c.getLong(4)
+                val dateModified = c.getLong(8)
+                val latestTime = maxOf(dateAdded, dateModified) * 1000L
                 result += VideoItem(
                     id = key,
                     uri = ContentUris.withAppendedId(collection, mediaId),
                     name = prefs.getString(KEY_NAME + key, null) ?: fileName.substringBeforeLast('.'),
                     sizeBytes = c.getLong(2),
                     durationMs = c.getLong(3),
-                    addedAt = c.getLong(4) * 1000,
+                    addedAt = latestTime,
                     folder = c.getString(5) ?: path?.trimEnd('/')?.substringAfterLast('/') ?: "Khác",
                     path = path,
                     mime = c.getString(6),
