@@ -118,10 +118,12 @@ fun PhotoScreen(vm: PhotoViewModel) {
     var access by remember { mutableStateOf(currentAccess(context, MediaKind.PHOTO)) }
     var query by rememberSaveable { mutableStateOf("") }
     var albumQuery by rememberSaveable { mutableStateOf("") }
-    var albumSort by rememberSaveable { mutableStateOf(AlbumSort.RECENT) }
-    var photoSort by rememberSaveable { mutableStateOf(PhotoSort.NEWEST) }
+    var albumSort by rememberSaveable { mutableStateOf(prefs.getString("album_sort", null)?.let { v -> AlbumSort.entries.firstOrNull { it.name == v } } ?: AlbumSort.RECENT) }
+    var photoSort by rememberSaveable { mutableStateOf(prefs.getString("photo_sort", null)?.let { v -> PhotoSort.entries.firstOrNull { it.name == v } } ?: PhotoSort.NEWEST) }
     var openAlbum by rememberSaveable { mutableStateOf<String?>(null) }
-    var gridMode by rememberSaveable { mutableStateOf(true) }
+    var gridMode by rememberSaveable { mutableStateOf(prefs.getBoolean("photo_grid_mode", true)) }
+    LaunchedEffect(albumSort) { prefs.edit().putString("album_sort", albumSort.name).apply() }
+    LaunchedEffect(photoSort) { prefs.edit().putString("photo_sort", photoSort.name).apply() }
     var viewer by remember { mutableStateOf<ViewerRequest?>(null) }
     var picking by rememberSaveable { mutableStateOf(false) }
     val homeGrid = rememberLazyGridState()
@@ -231,7 +233,7 @@ fun PhotoScreen(vm: PhotoViewModel) {
                                     showActions = has,
                                     sortOptions = AlbumSort.entries.map { it.label }, selectedSort = albumSort.ordinal,
                                     onSort = { albumSort = AlbumSort.entries[it] },
-                                    gridMode = gridMode, onToggle = { gridMode = !gridMode },
+                                    gridMode = gridMode, onToggle = { gridMode = !gridMode; prefs.edit().putBoolean("photo_grid_mode", gridMode).apply() },
                                     extraAction = if (access != Access.NONE && state.selected.isNotEmpty()) pickButton else null,
                                 )
                             }

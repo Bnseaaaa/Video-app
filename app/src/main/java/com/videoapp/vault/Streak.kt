@@ -8,6 +8,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -17,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
@@ -36,9 +43,17 @@ private val FireGradient = Brush.horizontalGradient(listOf(Color(0xFFFFB13B), Co
 
 @Composable
 fun FlameBadge(flame: Flame, size: Dp, modifier: Modifier = Modifier) {
+    val pulse = rememberInfiniteTransition(label = "flamePulse")
+    val scale by pulse.animateFloat(
+        initialValue = 0.94f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(tween(850, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "flameScale",
+    )
     Box(
         modifier
             .size(size)
+            .graphicsLayer { scaleX = scale; scaleY = scale }
             .clip(CircleShape)
             .background(flame.bg)
             .then(if (flame == Flame.WHITE) Modifier.border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape) else Modifier),
@@ -330,7 +345,7 @@ private fun ConfirmDialog(title: String, text: String, onYes: () -> Unit, onDone
 @Composable
 private fun Rules() {
     val rules = listOf(
-        "🔥 Mỗi ngày xem đủ 30 phút → +1 lửa đỏ. Ngày nào thiếu thì chuỗi lửa đỏ về 0.",
+        "🔥 Mỗi ngày xem đủ 15 phút → +1 lửa đỏ. Thời gian xem vượt mục tiêu được cộng sang ngày mai.",
         "🕐 Một ngày được tính từ 1:30 sáng đến 1:30 sáng hôm sau (xem lúc 1:00 đêm vẫn tính cho ngày hôm trước).",
         "⚪ Tích đủ 7 lửa đỏ → +1 lửa trắng. Mỗi lần nhận, mốc lần sau tăng thêm 1 ngày (7, 8, 9…).",
         "🔵 Nhận đủ 3 lửa trắng → +1 lửa xanh. Mốc lần sau cũng tăng thêm 1 (3, 4, 5…).",

@@ -10,12 +10,15 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.LruCache
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -26,6 +29,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -63,6 +68,7 @@ import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -77,6 +83,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 
 /** Danh sách video đang xem (thư mục / kết quả tìm kiếm), để nút "video trước / sau" biết chuyển tới đâu. */
 object PlayQueue {
@@ -109,7 +116,7 @@ class PlayerActivity : ComponentActivity() {
         val prefs = getSharedPreferences("kho_video", Context.MODE_PRIVATE)
         // Lưu nếu đã xem qua 2 giây và chưa đến sát cuối (còn hơn 3s)
         if (pos > 2_000L && dur > 5_000L && pos < dur - 3_000L) {
-            prefs.edit().putLong("playback_pos_$key", pos).apply()
+            prefs.edit().putLong("playback_pos_$key", pos).putString("last_playback_id", key).apply()
         } else if (pos >= dur - 3_000L || dur <= 5_000L) {
             prefs.edit().remove("playback_pos_$key").apply()
         }
@@ -146,6 +153,7 @@ class PlayerActivity : ComponentActivity() {
             val r = retriever ?: return@runCatching null
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST, PREVIEW_PX, PREVIEW_PX)
+                    ?: r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
             } else {
                 r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST)?.let { b ->
                     val s = PREVIEW_PX.toFloat() / maxOf(b.width, b.height)
@@ -167,6 +175,7 @@ class PlayerActivity : ComponentActivity() {
     private val tick = object : Runnable {
         override fun run() {
             flushWatch()
+            player?.let { savePlaybackPosition(currentItemKey(), it.currentPosition, it.duration) }
             handler.postDelayed(this, FLUSH_MS)
         }
     }
@@ -345,6 +354,28 @@ class PlayerActivity : ComponentActivity() {
 
     @Composable
     private fun PlayerScreen() {
+        val context = androidx.compose.ui.platform.LocalContext.current
+        val prefs = remember { getSharedPreferences("kho_video", Context.MODE_PRIVATE) }
+        var splitMode by rememberSaveable { mutableStateOf(prefs.getBoolean("player_split_mode", false)) }
+        var splitImageUri by rememberSaveable { mutableStateOf(prefs.getString("player_split_image", null)) }
+        var splitImage by remember { mutableStateOf<ImageBitmap?>(null) }
+        val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                splitImageUri = uri.toString()
+                prefs.edit().putString("player_split_image", splitImageUri).putBoolean("player_split_mode", true).apply()
+                splitMode = true
+            }
+        }
+        LaunchedEffect(splitImageUri) {
+            splitImage = splitImageUri?.let { raw ->
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        context.contentResolver.openInputStream(Uri.parse(raw))?.use { BitmapFactory.decodeStream(it)?.asImageBitmap() }
+                    }.getOrNull()
+                }
+            }
+        }
         var controls by remember { mutableStateOf(true) }
         var locked by rememberSaveable { mutableStateOf(false) }
         var showUnlock by remember { mutableStateOf(false) }
@@ -415,11 +446,37 @@ class PlayerActivity : ComponentActivity() {
                 .background(Color.Black)
                 .onSizeChanged { screenWidth = it.width }
         ) {
-            AndroidView({ playerView }, Modifier.fillMaxSize())
+            Column(Modifier.fillMaxSize()) {
+                AndroidView(
+                    { playerView },
+                    if (splitMode) Modifier.fillMaxWidth().weight(1f) else Modifier.fillMaxSize(),
+                )
+                if (splitMode) {
+                    Box(
+                        Modifier.fillMaxWidth().weight(1f).background(Color(0xFF111111)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (splitImage != null) {
+                            Image(splitImage!!, "Ảnh bên dưới video", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                        } else {
+                            TextButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) {
+                                Icon(Icons.Rounded.AddPhotoAlternate, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Chọn ảnh từ thư viện")
+                            }
+                        }
+                        TextButton(
+                            onClick = { imagePicker.launch(arrayOf("image/*")) },
+                            modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
+                        ) { Text("Đổi ảnh") }
+                    }
+                }
+            }
             // Vuốt ngang màn hình để tua live trên màn hình lớn; chạm/nhấp đúp 5s/giữ 2x
             Box(
                 Modifier
-                    .fillMaxSize()
+                    .fillMaxWidth()
+                    .then(if (splitMode) Modifier.fillMaxHeight(0.5f).align(Alignment.TopCenter) else Modifier.fillMaxSize())
                     .pointerInput(locked) {
                         if (locked) return@pointerInput
                         var totalDragX = 0f
@@ -594,6 +651,13 @@ class PlayerActivity : ComponentActivity() {
                             modifier = Modifier.padding(horizontal = 12.dp),
                         )
                     }
+                    IconButton(onClick = {
+                        splitMode = !splitMode
+                        prefs.edit().putBoolean("player_split_mode", splitMode).apply()
+                        if (splitMode && splitImage == null) imagePicker.launch(arrayOf("image/*"))
+                    }) {
+                        Icon(Icons.Rounded.Collections, "Bật/tắt video và ảnh", tint = Color.White)
+                    }
                 }
             }
 
@@ -608,7 +672,7 @@ class PlayerActivity : ComponentActivity() {
                 ) {
                     val fraction = seeking ?: if (dur > 0) pos.toFloat() / dur else 0f
                     var barWidth by remember { mutableIntStateOf(0) }
-                    Box(Modifier.fillMaxWidth().onSizeChanged { barWidth = it.width }) {
+                    Box(Modifier.fillMaxWidth().height(if (seeking != null) 220.dp else 36.dp).onSizeChanged { barWidth = it.width }) {
                         SeekBar(
                             fraction = fraction,
                             onChange = { seeking = it },
@@ -618,19 +682,16 @@ class PlayerActivity : ComponentActivity() {
                                 seeking = null
                                 touched++
                             },
+                            modifier = Modifier.align(Alignment.BottomCenter),
                         )
                         // Ô xem trước nằm ngay trên nút tròn, chạy theo ngón tay
                         seeking?.let { f ->
                             SeekPreview(
                                 image = preview,
                                 time = formatDuration((f * dur).toLong()),
-                                modifier = Modifier.layout { measurable, _ ->
-                                    val p = measurable.measure(Constraints())
-                                    val r = SEEK_THUMB.toPx()
-                                    val cx = r + (barWidth - 2 * r) * f
-                                    val x = (cx - p.width / 2).toInt().coerceIn(0, (barWidth - p.width).coerceAtLeast(0))
-                                    // Không chiếm chỗ trong bố cục, chỉ vẽ nổi phía trên thanh tua
-                                    layout(0, 0) { p.place(x, -p.height - 4.dp.roundToPx()) }
+                                modifier = Modifier.align(Alignment.TopStart).offset {
+                                    val previewWidth = 176.dp.roundToPx()
+                                    IntOffset(((barWidth * f).toInt() - previewWidth / 2).coerceIn(0, (barWidth - previewWidth).coerceAtLeast(0)), 0)
                                 },
                             )
                         }
@@ -756,7 +817,7 @@ class PlayerActivity : ComponentActivity() {
 
     /** Thanh tua: vạch mảnh màu trắng + nút tròn trắng, chạm hoặc kéo để tua. */
     @Composable
-    private fun SeekBar(fraction: Float, onChange: (Float) -> Unit, onDone: (Float) -> Unit) {
+    private fun SeekBar(fraction: Float, onChange: (Float) -> Unit, onDone: (Float) -> Unit, modifier: Modifier = Modifier) {
         var width by remember { mutableIntStateOf(1) }
         var dragging by remember { mutableStateOf(false) }
         var current by remember { mutableFloatStateOf(0f) }
@@ -764,24 +825,37 @@ class PlayerActivity : ComponentActivity() {
         val done by rememberUpdatedState(onDone)
         val thumb = SEEK_THUMB
         Box(
-            Modifier
+            modifier
                 .fillMaxWidth()
                 .height(36.dp)
                 .onSizeChanged { width = it.width }
                 .pointerInput(Unit) {
                     val r = thumb.toPx()
                     fun f(x: Float) = ((x - r) / (width - 2 * r)).coerceIn(0f, 1f)
-                    detectTapGestures { o -> f(o.x).let { change(it); done(it) } }
-                }
-                .pointerInput(Unit) {
-                    val r = thumb.toPx()
-                    fun f(x: Float) = ((x - r) / (width - 2 * r)).coerceIn(0f, 1f)
-                    detectHorizontalDragGestures(
-                        onDragStart = { o -> dragging = true; current = f(o.x); change(current) },
-                        onHorizontalDrag = { ch, _ -> current = f(ch.position.x); change(current) },
-                        onDragEnd = { dragging = false; done(current) },
-                        onDragCancel = { dragging = false; done(current) },
-                    )
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        dragging = true
+                        current = f(down.position.x)
+                        change(current)
+                        down.consume()
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                            current = f(pointer.position.x)
+                            change(current)
+                            val released = !pointer.pressed
+                            pointer.consume()
+                            if (released) {
+                                dragging = false
+                                done(current)
+                                break
+                            }
+                        }
+                        if (dragging) {
+                            dragging = false
+                            done(current)
+                        }
+                    }
                 },
         ) {
             Canvas(Modifier.fillMaxSize()) {

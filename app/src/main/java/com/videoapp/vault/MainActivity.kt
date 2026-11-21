@@ -207,13 +207,15 @@ private fun LibraryScreen(vm: LibraryViewModel) {
     val prefs = remember { context.getSharedPreferences("kho_video", Context.MODE_PRIVATE) }
     var query by rememberSaveable { mutableStateOf("") }          // tìm ở màn hình chính (toàn máy)
     var folderQuery by rememberSaveable { mutableStateOf("") }    // tìm trong thư mục đang mở
-    var sort by rememberSaveable { mutableStateOf(SortMode.NEWEST) }
-    var folderSort by rememberSaveable { mutableStateOf(FolderSort.RECENT) }
+    var sort by rememberSaveable { mutableStateOf(prefs.getString("video_sort", null)?.let { value -> SortMode.entries.firstOrNull { it.name == value } } ?: SortMode.NEWEST) }
+    var folderSort by rememberSaveable { mutableStateOf(prefs.getString("folder_sort", null)?.let { value -> FolderSort.entries.firstOrNull { it.name == value } } ?: FolderSort.RECENT) }
     var openFolder by rememberSaveable { mutableStateOf<String?>(null) }
     var gridMode by rememberSaveable { mutableStateOf(prefs.getBoolean("video_grid_mode", false)) }
     var showWidgets by rememberSaveable { mutableStateOf(prefs.getBoolean("show_widgets", true)) }
     var selectionMode by rememberSaveable { mutableStateOf(false) }
     var selectedIds by rememberSaveable { mutableStateOf(setOf<String>()) }
+    LaunchedEffect(sort) { prefs.edit().putString("video_sort", sort.name).apply() }
+    LaunchedEffect(folderSort) { prefs.edit().putString("folder_sort", folderSort.name).apply() }
     var singleDeleteFor by remember { mutableStateOf<VideoItem?>(null) }
     var confirmDeleteMulti by remember { mutableStateOf(false) }
     var sheetFor by remember { mutableStateOf<VideoItem?>(null) }
@@ -313,6 +315,9 @@ private fun LibraryScreen(vm: LibraryViewModel) {
     }
 
     val visible = remember(state.videos) { state.videos.filterNot { it.hidden } }
+    val resumeId = prefs.getString("last_playback_id", null)
+    val resumeItem = remember(state.videos, resumeId) { state.videos.firstOrNull { it.id == resumeId } }
+    val resumePosition = resumeId?.let { prefs.getLong("playback_pos_$it", 0L) } ?: 0L
     val hiddenVideos = remember(state.videos) { state.videos.filter { it.hidden } }
     val folders = remember(visible, folderSort) {
         visible.groupBy { it.folder }.map { (name, list) -> FolderInfo(name, name, list) }.let { list ->
@@ -484,6 +489,11 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                             return@LazyVerticalGrid
                         }
                         if (!searching && showWidgets) fullLine("streak") { StreakCard(streak) { streakOpen = true } }
+                        if (!searching && resumeItem != null && resumePosition > 0L) {
+                            fullLine("continue") {
+                                ContinueWatchingCard(resumeItem!!, resumePosition) { play(resumeItem!!) }
+                            }
+                        }
                         if (access == Access.PARTIAL) {
                             fullLine("partial") { PartialAccessBanner(onAllowAll = requestAccess) }
                         }
@@ -931,6 +941,26 @@ private fun StatsCard(videos: List<VideoItem>, folderCount: Int) {
             Stat(Icons.Rounded.VideoLibrary, videos.size.toString(), "video")
             Stat(Icons.Rounded.Schedule, formatTotalDuration(totalDuration), "tổng thời lượng")
             Stat(Icons.Rounded.SdStorage, Formatter.formatShortFileSize(context, totalSize), "dung lượng")
+        }
+    }
+}
+
+@Composable
+private fun ContinueWatchingCard(item: VideoItem, positionMs: Long, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+    ) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.PlayCircle, null, Modifier.size(36.dp), tint = MaterialTheme.colorScheme.onSecondaryContainer)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Xem tiếp", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                Text(item.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Tiếp tục từ ${formatDuration(positionMs)}", style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
 }

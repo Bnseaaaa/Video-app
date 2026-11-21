@@ -60,7 +60,7 @@ data class StreakState(
 }
 
 object StreakStore {
-    const val BASE_SEC = 30 * 60L
+    const val BASE_SEC = 15 * 60L
     const val MIN_SEC = 60L
     const val WHITE_BASE = 7
     const val BLUE_BASE = 3
@@ -194,7 +194,13 @@ object StreakStore {
         if (!::prefs.isInitialized || seconds <= 0) return emptyList()
         val t = today()
         val before = sec(t) >= req(t)
-        prefs.edit().putLong(K_SEC + t, sec(t) + seconds).apply()
+        val total = sec(t) + seconds
+        val target = req(t)
+        // Carry today's surplus into tomorrow's viewing progress.
+        prefs.edit()
+            .putLong(K_SEC + t, minOf(total, target))
+            .putLong(K_SEC + (t + 1), sec(t + 1) + (total - target).coerceAtLeast(0L))
+            .apply()
         val msgs = refresh().toMutableList()
         val s = _state.value
         if (!before && s.todayMet) {
