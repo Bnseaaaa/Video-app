@@ -16,9 +16,7 @@ import android.net.Uri
 import android.util.LruCache
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -27,11 +25,18 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -43,6 +48,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -51,28 +57,29 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.content.FileProvider
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import androidx.compose.foundation.Image
@@ -153,6 +160,8 @@ class PlayerActivity : ComponentActivity() {
             val r = retriever ?: return@runCatching null
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST, PREVIEW_PX, PREVIEW_PX)
+                    ?: r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, PREVIEW_PX, PREVIEW_PX)
+                    ?: r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
             } else {
                 r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST)?.let { b ->
@@ -204,7 +213,11 @@ class PlayerActivity : ComponentActivity() {
         }
 
         override fun onPlayerError(e: PlaybackException) {
-            error = "Không phát được video này"
+            error = if (e.errorCodeName.contains("DECOD", ignoreCase = true)) {
+                "Codec video này không phát được bằng bộ giải mã hiện tại"
+            } else {
+                "Không phát được video này (${e.errorCodeName})"
+            }
         }
     }
 
@@ -252,6 +265,8 @@ class PlayerActivity : ComponentActivity() {
         playerView = PlayerView(this).apply {
             useController = false
             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            // Keep the current frame visible while ExoPlayer prepares the next video.
+            setKeepContentOnPlayerReset(true)
             setShutterBackgroundColor(android.graphics.Color.BLACK)
         }
 
@@ -268,7 +283,8 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        player = ExoPlayer.Builder(this).build().also { p ->
+        val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+        player = ExoPlayer.Builder(this).setRenderersFactory(renderers).build().also { p ->
             playerView.player = p
             p.addListener(listener)
         }
@@ -343,6 +359,20 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
+    private fun openInAnotherPlayer() {
+        val item = queue.getOrNull(index) ?: return
+        val uri = item.localFile?.let { file ->
+            runCatching { FileProvider.getUriForFile(this, "$packageName.fileprovider", file) }.getOrNull()
+        } ?: item.uri
+        val type = item.mime ?: contentResolver.getType(uri) ?: "video/*"
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, type)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivity(Intent.createChooser(view, "Mở video bằng")) }
+            .onFailure { error = "Không tìm thấy ứng dụng khác có thể mở video này" }
+    }
+
     /** Nút xoay: chuyển qua lại giữa dọc và ngang. */
     private fun toggleOrientation() {
         val landscapeNow = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -357,19 +387,59 @@ class PlayerActivity : ComponentActivity() {
         val context = androidx.compose.ui.platform.LocalContext.current
         val prefs = remember { getSharedPreferences("kho_video", Context.MODE_PRIVATE) }
         var splitMode by rememberSaveable { mutableStateOf(prefs.getBoolean("player_split_mode", false)) }
+        var splitRatio by rememberSaveable { mutableFloatStateOf(prefs.getFloat("player_split_ratio", 0.5f).coerceIn(0.25f, 0.75f)) }
+        var splitImageZoom by rememberSaveable { mutableFloatStateOf(1f) }
+        var splitAutoPlay by rememberSaveable { mutableStateOf(prefs.getBoolean("player_split_auto_play", false)) }
+        var splitAreaHeightPx by remember { mutableIntStateOf(0) }
         var splitImageUri by rememberSaveable { mutableStateOf(prefs.getString("player_split_image", null)) }
         var splitImage by remember { mutableStateOf<ImageBitmap?>(null) }
-        val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri != null) {
-                runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-                splitImageUri = uri.toString()
-                prefs.edit().putString("player_split_image", splitImageUri).putBoolean("player_split_mode", true).apply()
-                splitMode = true
+        val photoRepo = remember(context) { PhotoRepository(context) }
+        var showSplitPhotoPicker by remember { mutableStateOf(false) }
+        var splitPickerLoading by remember { mutableStateOf(false) }
+        var splitPickerPhotos by remember { mutableStateOf<List<PhotoItem>>(emptyList()) }
+        LaunchedEffect(showSplitPhotoPicker, splitMode) {
+            if (showSplitPhotoPicker || splitMode) {
+                splitPickerLoading = true
+                val selectedDirs = photoRepo.selectedDirs()
+                splitPickerPhotos = photoRepo.scan()
+                    .filter { it.dirKey in selectedDirs }
+                    .sortedByDescending { it.takenAt }
+                splitPickerLoading = false
             }
         }
-        LaunchedEffect(splitImageUri) {
-            splitImage = splitImageUri?.let { raw ->
-                withContext(Dispatchers.IO) {
+        val selectedSplitPhotoIndex = splitPickerPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
+        val splitPagerState = rememberPagerState(
+            initialPage = selectedSplitPhotoIndex.coerceAtLeast(0),
+        ) { splitPickerPhotos.size }
+        LaunchedEffect(splitImageUri, splitPickerPhotos) {
+            val target = splitPickerPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
+            if (target >= 0 && target != splitPagerState.currentPage) splitPagerState.scrollToPage(target)
+        }
+        LaunchedEffect(splitAutoPlay, splitMode, splitPagerState.currentPage, splitPickerPhotos.size) {
+            if (splitAutoPlay && splitMode && splitPickerPhotos.size > 1) {
+                delay(3_000)
+                val next = (splitPagerState.currentPage + 1) % splitPickerPhotos.size
+                splitPagerState.animateScrollToPage(next)
+            }
+        }
+        LaunchedEffect(splitPagerState.currentPage, splitPickerPhotos) {
+            val photo = splitPickerPhotos.getOrNull(splitPagerState.currentPage) ?: return@LaunchedEffect
+            val selectedIndex = splitPickerPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
+            if (!splitPagerState.isScrollInProgress && (selectedIndex < 0 || selectedIndex != splitPagerState.currentPage)) {
+                return@LaunchedEffect
+            }
+            if (photo.uri.toString() != splitImageUri) {
+                splitImageUri = photo.uri.toString()
+                prefs.edit().putString("player_split_image", splitImageUri).apply()
+            }
+            splitImageZoom = 1f
+        }
+        LaunchedEffect(splitImageUri, splitPickerPhotos) {
+            val raw = splitImageUri
+            if (raw == null || splitPickerPhotos.any { it.uri.toString() == raw }) {
+                splitImage = null
+            } else {
+                splitImage = withContext(Dispatchers.IO) {
                     runCatching {
                         context.contentResolver.openInputStream(Uri.parse(raw))?.use { BitmapFactory.decodeStream(it)?.asImageBitmap() }
                     }.getOrNull()
@@ -377,15 +447,20 @@ class PlayerActivity : ComponentActivity() {
             }
         }
         var controls by remember { mutableStateOf(true) }
+        var videoZoom by remember { mutableFloatStateOf(1f) }
         var locked by rememberSaveable { mutableStateOf(false) }
         var showUnlock by remember { mutableStateOf(false) }
         var pos by remember { mutableLongStateOf(0L) }
         var dur by remember { mutableLongStateOf(0L) }
         var seeking by remember { mutableStateOf<Float?>(null) }
+        var wasPlayingBeforeSeek by remember { mutableStateOf(false) }
+        var lastSeekPreviewAt by remember { mutableLongStateOf(0L) }
         var touched by remember { mutableIntStateOf(0) }   // tăng mỗi lần bấm nút → đếm lại thời gian tự ẩn
         var flash by remember { mutableStateOf<String?>(null) }  // chữ "« 5 giây" / "5 giây »" ở giữa màn hình
         var fast by remember { mutableStateOf(false) }  // đang giữ màn hình để tua nhanh
         var preview by remember { mutableStateOf<ImageBitmap?>(null) }  // khung hình xem trước khi kéo thanh tua
+        var seekFrameTarget by remember { mutableStateOf<Long?>(null) }
+        var thumbnailPreview by remember { mutableStateOf<ImageBitmap?>(null) }
         var isSwiping by remember { mutableStateOf(false) }
         var swipeTargetPos by remember { mutableLongStateOf(0L) }
         var swipeDeltaSec by remember { mutableLongStateOf(0L) }
@@ -398,15 +473,35 @@ class PlayerActivity : ComponentActivity() {
                 resumeFlash = null
             }
         }
-        // Khi kéo: lấy khung hình ở vị trí đang kéo tới (làm tròn theo giây); kéo nhanh thì bỏ qua các vị trí cũ
-        LaunchedEffect(Unit) {
-            snapshotFlow { seeking?.let { (it * dur).toLong() / 1000 * 1000 } }
-                .filterNotNull()
-                .distinctUntilChanged()
-                .collectLatest { t -> frameAt(queue[index].uri, t)?.let { preview = it.asImageBitmap() } }
+        // Trong lúc kéo, lấy khung mới nhất theo nhịp; bỏ qua các vị trí cũ nếu giải mã chưa xong.
+        LaunchedEffect(index) {
+            preview = null
+            // Show the system-generated video thumbnail while an exact seek frame is being decoded.
+            val fallback = runCatching { VideoRepository(this@PlayerActivity).thumbnail(queue[index]) }.getOrNull()
+            thumbnailPreview = fallback?.asImageBitmap()
         }
-        LaunchedEffect(index) { preview = null }
-        LaunchedEffect(seeking == null) { if (seeking == null) preview = null }
+        LaunchedEffect(seeking == null, thumbnailPreview) {
+            if (seeking == null && seekFrameTarget == null) preview = null else if (preview == null) preview = thumbnailPreview
+        }
+        LaunchedEffect(seekFrameTarget, index) {
+            val target = seekFrameTarget ?: return@LaunchedEffect
+            val bitmap = frameAt(queue[index].uri, target)
+            if (seekFrameTarget == target && bitmap != null) preview = bitmap.asImageBitmap()
+            delay(700)
+            if (seekFrameTarget == target) { seekFrameTarget = null; preview = null }
+        }
+        LaunchedEffect(isSwiping, index) {
+            if (isSwiping) {
+                while (isSwiping) {
+                    val target = swipeTargetPos
+                    val sampled = target / 500L * 500L
+                    frameAt(queue[index].uri, sampled)?.let { bitmap ->
+                        if (isSwiping && swipeTargetPos == target) preview = bitmap.asImageBitmap()
+                    }
+                    delay(160)
+                }
+            }
+        }
         val p = player
 
         LaunchedEffect(p) {
@@ -446,37 +541,165 @@ class PlayerActivity : ComponentActivity() {
                 .background(Color.Black)
                 .onSizeChanged { screenWidth = it.width }
         ) {
-            Column(Modifier.fillMaxSize()) {
-                AndroidView(
-                    { playerView },
-                    if (splitMode) Modifier.fillMaxWidth().weight(1f) else Modifier.fillMaxSize(),
-                )
+            val dividerHeightPx = with(androidx.compose.ui.platform.LocalDensity.current) { 24.dp.toPx() }
+            val videoPaneFraction = if (splitAreaHeightPx > 0) {
+                ((splitAreaHeightPx - dividerHeightPx) * splitRatio / splitAreaHeightPx).coerceIn(0.2f, 0.8f)
+            } else splitRatio
+            Column(Modifier.fillMaxSize().onSizeChanged { splitAreaHeightPx = it.height }) {
+                Box(
+                    (if (splitMode) Modifier.fillMaxWidth().weight(splitRatio) else Modifier.fillMaxSize())
+                        .clipToBounds(),
+                ) {
+                    AndroidView(
+                        { playerView },
+                        Modifier.fillMaxSize().graphicsLayer {
+                            scaleX = videoZoom
+                            scaleY = videoZoom
+                        },
+                    )
+                }
                 if (splitMode) {
                     Box(
-                        Modifier.fillMaxWidth().weight(1f).background(Color(0xFF111111)),
+                        Modifier.fillMaxWidth().height(24.dp).background(Color(0xFF202124))
+                            .pointerInput(splitAreaHeightPx) {
+                                detectVerticalDragGestures(
+                                    onVerticalDrag = { change, drag ->
+                                        change.consume()
+                                        if (splitAreaHeightPx > 0) {
+                                            splitRatio = (splitRatio + drag / splitAreaHeightPx).coerceIn(0.25f, 0.75f)
+                                        }
+                                    },
+                                    onDragEnd = { prefs.edit().putFloat("player_split_ratio", splitRatio).apply() },
+                                    onDragCancel = { prefs.edit().putFloat("player_split_ratio", splitRatio).apply() },
+                                )
+                            },
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (splitImage != null) {
-                            Image(splitImage!!, "Ảnh bên dưới video", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                        Box(Modifier.width(52.dp).height(4.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.8f)))
+                    }
+                    Box(
+                        Modifier.fillMaxWidth().weight(1f - splitRatio)
+                            .clipToBounds()
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                    var previousDistance = 0f
+                                    do {
+                                        val event = awaitPointerEvent()
+                                        val fingers = event.changes.filter { it.pressed }
+                                        if (fingers.size >= 2) {
+                                            val dx = fingers[0].position.x - fingers[1].position.x
+                                            val dy = fingers[0].position.y - fingers[1].position.y
+                                            val distance = kotlin.math.sqrt(dx * dx + dy * dy)
+                                            if (previousDistance > 0f && distance > 0f) {
+                                                splitImageZoom = (splitImageZoom * (distance / previousDistance)).coerceIn(1f, 4f)
+                                            }
+                                            previousDistance = distance
+                                            fingers.forEach { it.consume() }
+                                        } else {
+                                            previousDistance = 0f
+                                        }
+                                    } while (event.changes.any { it.pressed })
+                                }
+                            }
+                            .background(Color(0xFF111111)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (splitPickerPhotos.isNotEmpty() && selectedSplitPhotoIndex >= 0) {
+                            HorizontalPager(
+                                state = splitPagerState,
+                                modifier = Modifier.fillMaxSize(),
+                            ) { page ->
+                                SplitPhotoPage(
+                                    photo = splitPickerPhotos[page],
+                                    repository = photoRepo,
+                                    zoom = splitImageZoom,
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                            }
+                        } else if (splitImage != null) {
+                            Image(
+                                splitImage!!,
+                                "Ảnh bên dưới video",
+                                Modifier.fillMaxSize().graphicsLayer {
+                                    scaleX = splitImageZoom
+                                    scaleY = splitImageZoom
+                                },
+                                contentScale = ContentScale.Fit,
+                            )
                         } else {
-                            TextButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) {
+                            TextButton(onClick = { showSplitPhotoPicker = true }) {
                                 Icon(Icons.Rounded.AddPhotoAlternate, null)
                                 Spacer(Modifier.width(8.dp))
-                                Text("Chọn ảnh từ thư viện")
+                                Text("Chọn ảnh trong mục Ảnh")
                             }
                         }
-                        TextButton(
-                            onClick = { imagePicker.launch(arrayOf("image/*")) },
-                            modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
-                        ) { Text("Đổi ảnh") }
+                        Row(
+                            Modifier.align(Alignment.BottomEnd).padding(6.dp)
+                                .clip(CircleShape).background(Color.Black.copy(alpha = 0.55f)),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (splitPickerPhotos.size > 1 && selectedSplitPhotoIndex >= 0) {
+                                IconButton(
+                                    onClick = {
+                                        splitAutoPlay = !splitAutoPlay
+                                        prefs.edit().putBoolean("player_split_auto_play", splitAutoPlay).apply()
+                                    },
+                                ) {
+                                    Icon(
+                                        if (splitAutoPlay) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                        if (splitAutoPlay) "Dừng tự chuyển ảnh" else "Tự chuyển ảnh",
+                                        tint = Color.White,
+                                    )
+                                }
+                            }
+                            TextButton(onClick = { showSplitPhotoPicker = true }) { Text("Đổi ảnh", color = Color.White) }
+                        }
                     }
                 }
             }
             // Vuốt ngang màn hình để tua live trên màn hình lớn; chạm/nhấp đúp 5s/giữ 2x
+            if ((seekFrameTarget != null || isSwiping) && preview != null) {
+                Image(
+                    bitmap = preview!!,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxWidth()
+                        .then(if (splitMode) Modifier.fillMaxHeight(videoPaneFraction).align(Alignment.TopCenter) else Modifier.fillMaxSize().align(Alignment.Center))
+                        .graphicsLayer {
+                            scaleX = videoZoom
+                            scaleY = videoZoom
+                        }
+                        .background(Color.Black),
+                    contentScale = ContentScale.Fit,
+                )
+            }
             Box(
                 Modifier
                     .fillMaxWidth()
-                    .then(if (splitMode) Modifier.fillMaxHeight(0.5f).align(Alignment.TopCenter) else Modifier.fillMaxSize())
+                    .then(if (splitMode) Modifier.fillMaxHeight(videoPaneFraction).align(Alignment.TopCenter) else Modifier.fillMaxSize())
+                    .pointerInput(locked) {
+                        if (locked) return@pointerInput
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            var previousDistance = 0f
+                            do {
+                                val event = awaitPointerEvent()
+                                val fingers = event.changes.filter { it.pressed }
+                                if (fingers.size >= 2) {
+                                    val dx = fingers[0].position.x - fingers[1].position.x
+                                    val dy = fingers[0].position.y - fingers[1].position.y
+                                    val distance = kotlin.math.sqrt(dx * dx + dy * dy)
+                                    if (previousDistance > 0f && distance > 0f) {
+                                        videoZoom = (videoZoom * (distance / previousDistance)).coerceIn(1f, 4f)
+                                    }
+                                    previousDistance = distance
+                                    fingers.forEach { it.consume() }
+                                } else {
+                                    previousDistance = 0f
+                                }
+                            } while (event.changes.any { it.pressed })
+                        }
+                    }
                     .pointerInput(locked) {
                         if (locked) return@pointerInput
                         var totalDragX = 0f
@@ -489,7 +712,8 @@ class PlayerActivity : ComponentActivity() {
                                 isSwiping = true
                                 swipeTargetPos = startPos
                                 swipeDeltaSec = 0L
-                                pl.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                                seekFrameTarget = null
+                                preview = null
                             },
                             onHorizontalDrag = { change, dragAmount ->
                                 change.consume()
@@ -500,19 +724,17 @@ class PlayerActivity : ComponentActivity() {
                                 val target = (startPos + deltaMs.toLong()).coerceIn(0L, dur)
                                 swipeTargetPos = target
                                 swipeDeltaSec = (target - startPos) / 1000
-                                pl.seekTo(target)
-                                pos = target
                             },
                             onDragEnd = {
                                 isSwiping = false
-                                player?.setSeekParameters(SeekParameters.EXACT)
                                 player?.seekTo(swipeTargetPos)
                                 pos = swipeTargetPos
+                                seekFrameTarget = swipeTargetPos / 500L * 500L
                                 touched++
                             },
                             onDragCancel = {
                                 isSwiping = false
-                                player?.setSeekParameters(SeekParameters.EXACT)
+                                preview = null
                             },
                         )
                     }
@@ -524,7 +746,7 @@ class PlayerActivity : ComponentActivity() {
                                     val isRight = offset.x >= screenWidth / 2
                                     val delta = if (isRight) 5_000L else -5_000L
                                     seekBy(delta)
-                                    flash = if (isRight) "5 giây »" else "« 5 giây"
+                                    seekFrameTarget = player?.currentPosition
                                     touched++
                                 }
                             },
@@ -553,41 +775,6 @@ class PlayerActivity : ComponentActivity() {
 
             // Khung hiển thị khi vuốt trên màn hình để tua
             AnimatedVisibility(
-                isSwiping,
-                enter = fadeIn(),
-                exit = fadeOut(),
-                modifier = Modifier.align(Alignment.Center),
-            ) {
-                Column(
-                    Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color.Black.copy(alpha = 0.75f))
-                        .padding(horizontal = 24.dp, vertical = 14.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    val sign = if (swipeDeltaSec >= 0) "+" else ""
-                    Icon(
-                        if (swipeDeltaSec >= 0) Icons.Rounded.FastForward else Icons.Rounded.FastRewind,
-                        null,
-                        tint = Color.White,
-                        modifier = Modifier.size(36.dp),
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "${formatDuration(swipeTargetPos)} / ${formatDuration(dur)}",
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text(
-                        "[$sign${swipeDeltaSec}s]",
-                        color = Color.White.copy(alpha = 0.8f),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
-            }
-            // Nhãn "Tua nhanh 2x" khi đang giữ
-            AnimatedVisibility(
                 fast, enter = fadeIn(), exit = fadeOut(),
                 modifier = Modifier.align(Alignment.TopCenter)
                     .windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.statusBars))
@@ -603,7 +790,23 @@ class PlayerActivity : ComponentActivity() {
                 }
             }
 
-            if (buffering && error == null) {
+            if (showSplitPhotoPicker) {
+                SplitPhotoPicker(
+                    photos = splitPickerPhotos,
+                    loading = splitPickerLoading,
+                    repository = photoRepo,
+                    onSelect = { photo ->
+                        splitImageUri = photo.uri.toString()
+                        splitImageZoom = 1f
+                        prefs.edit().putString("player_split_image", splitImageUri).putBoolean("player_split_mode", true).apply()
+                        splitMode = true
+                        showSplitPhotoPicker = false
+                    },
+                    onDismiss = { showSplitPhotoPicker = false },
+                )
+            }
+
+            if (buffering && error == null && seeking == null && seekFrameTarget == null) {
                 CircularProgressIndicator(Modifier.align(Alignment.Center).size(48.dp), color = Color.White)
             }
             error?.let {
@@ -611,6 +814,12 @@ class PlayerActivity : ComponentActivity() {
                     Icon(Icons.Rounded.ErrorOutline, null, tint = Color.White, modifier = Modifier.size(44.dp))
                     Spacer(Modifier.height(8.dp))
                     Text(it, color = Color.White)
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(onClick = { openInAnotherPlayer() }) {
+                        Icon(Icons.Rounded.OpenInNew, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Mở bằng ứng dụng khác")
+                    }
                 }
             }
             flash?.let {
@@ -654,7 +863,7 @@ class PlayerActivity : ComponentActivity() {
                     IconButton(onClick = {
                         splitMode = !splitMode
                         prefs.edit().putBoolean("player_split_mode", splitMode).apply()
-                        if (splitMode && splitImage == null) imagePicker.launch(arrayOf("image/*"))
+                        if (splitMode && splitImage == null) showSplitPhotoPicker = true
                     }) {
                         Icon(Icons.Rounded.Collections, "Bật/tắt video và ảnh", tint = Color.White)
                     }
@@ -662,39 +871,61 @@ class PlayerActivity : ComponentActivity() {
             }
 
             // Thanh dưới: thanh tua, thời gian, các nút
-            AnimatedVisibility(controls && !locked, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.BottomCenter)) {
+            AnimatedVisibility(
+                controls && !locked,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = if (splitMode) {
+                    Modifier.align(Alignment.TopCenter).fillMaxWidth().fillMaxHeight(videoPaneFraction)
+                } else {
+                    Modifier.align(Alignment.BottomCenter)
+                },
+            ) {
                 Column(
                     Modifier
                         .fillMaxWidth()
+                        .then(if (splitMode) Modifier.fillMaxHeight() else Modifier)
                         .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f), Color.Black.copy(alpha = 0.9f))))
-                        .windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.navigationBars))
-                        .padding(start = 20.dp, end = 20.dp, top = 48.dp, bottom = 20.dp),
+                        .then(
+                            if (splitMode) Modifier.windowInsetsPadding(WindowInsets.displayCutout)
+                            else Modifier.windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.navigationBars)),
+                        )
+                        .padding(start = 20.dp, end = 20.dp, top = if (splitMode) 8.dp else 48.dp, bottom = if (splitMode) 8.dp else 20.dp),
+                    verticalArrangement = Arrangement.Bottom,
                 ) {
                     val fraction = seeking ?: if (dur > 0) pos.toFloat() / dur else 0f
-                    var barWidth by remember { mutableIntStateOf(0) }
-                    Box(Modifier.fillMaxWidth().height(if (seeking != null) 220.dp else 36.dp).onSizeChanged { barWidth = it.width }) {
+                    Box(Modifier.fillMaxWidth().height(36.dp)) {
                         SeekBar(
                             fraction = fraction,
-                            onChange = { seeking = it },
+                            onChange = { value ->
+                                if (seeking == null) {
+                                    seekFrameTarget = null
+                                    wasPlayingBeforeSeek = player?.isPlaying == true
+                                    if (wasPlayingBeforeSeek) player?.pause()
+                                    lastSeekPreviewAt = 0L
+                                    player?.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                                }
+                                seeking = value
+                                val now = SystemClock.elapsedRealtime()
+                                if (now - lastSeekPreviewAt >= 160L) {
+                                    player?.seekTo((value * dur).toLong())
+                                    lastSeekPreviewAt = now
+                                }
+                            },
                             onDone = { f ->
-                                player?.seekTo((f * dur).toLong())
-                                pos = (f * dur).toLong()
+                                val target = (f * dur).toLong()
+                                seekFrameTarget = target / 500L * 500L
+                                player?.setSeekParameters(SeekParameters.EXACT)
+                                player?.seekTo(target)
+                                pos = target
                                 seeking = null
+                                if (wasPlayingBeforeSeek) player?.play()
+                                wasPlayingBeforeSeek = false
                                 touched++
                             },
                             modifier = Modifier.align(Alignment.BottomCenter),
                         )
                         // Ô xem trước nằm ngay trên nút tròn, chạy theo ngón tay
-                        seeking?.let { f ->
-                            SeekPreview(
-                                image = preview,
-                                time = formatDuration((f * dur).toLong()),
-                                modifier = Modifier.align(Alignment.TopStart).offset {
-                                    val previewWidth = 176.dp.roundToPx()
-                                    IntOffset(((barWidth * f).toInt() - previewWidth / 2).coerceIn(0, (barWidth - previewWidth).coerceAtLeast(0)), 0)
-                                },
-                            )
-                        }
                     }
                     Row(Modifier.fillMaxWidth().padding(horizontal = 2.dp)) {
                         val shownPos = seeking?.let { (it * dur).toLong() } ?: pos
@@ -710,7 +941,7 @@ class PlayerActivity : ComponentActivity() {
                     ) {
                         CtrlButton(Icons.Rounded.LockOpen, "Khoá màn hình") { locked = true; showUnlock = true }
                         CtrlButton(Icons.Rounded.SkipPrevious, "Video trước", enabled = index > 0) { act { go(-1) } }
-                        CtrlButton(Icons.Rounded.Replay5, "Lùi 5 giây") { act { seekBy(-5_000); flash = "« 5 giây" } }
+                        CtrlButton(Icons.Rounded.Replay5, "Lùi 5 giây") { act { seekBy(-5_000); seekFrameTarget = player?.currentPosition } }
                         IconButton(onClick = { act { togglePlay() } }, modifier = Modifier.size(64.dp)) {
                             Icon(
                                 when {
@@ -723,7 +954,7 @@ class PlayerActivity : ComponentActivity() {
                                 modifier = Modifier.size(56.dp),
                             )
                         }
-                        CtrlButton(Icons.Rounded.Forward5, "Tới 5 giây") { act { seekBy(5_000); flash = "5 giây »" } }
+                        CtrlButton(Icons.Rounded.Forward5, "Tới 5 giây") { act { seekBy(5_000); seekFrameTarget = player?.currentPosition } }
                         CtrlButton(Icons.Rounded.SkipNext, "Video sau", enabled = index < queue.lastIndex) { act { go(1) } }
                         CtrlButton(Icons.Rounded.ScreenRotation, "Xoay màn hình") { act { toggleOrientation() } }
                     }
@@ -895,6 +1126,102 @@ class PlayerActivity : ComponentActivity() {
                     .setData(item.uri)
                     .putExtra(EXTRA_INDEX, list.indexOfFirst { it.id == item.id }),
             )
+        }
+    }
+}
+@Composable
+private fun SplitPhotoPage(
+    photo: PhotoItem,
+    repository: PhotoRepository,
+    zoom: Float,
+    modifier: Modifier = Modifier,
+) {
+    var image by remember(photo.id) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(photo.id) {
+        image = repository.full(photo)?.asImageBitmap()
+    }
+    Box(modifier, contentAlignment = Alignment.Center) {
+        val bitmap = image
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = photo.name,
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    scaleX = zoom
+                    scaleY = zoom
+                },
+                contentScale = ContentScale.Fit,
+            )
+        } else {
+            CircularProgressIndicator(color = Color.White)
+        }
+    }
+}
+
+@Composable
+private fun SplitPhotoPicker(
+    photos: List<PhotoItem>,
+    loading: Boolean,
+    repository: PhotoRepository,
+    onSelect: (PhotoItem) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = MaterialTheme.shapes.extraLarge,
+            color = MaterialTheme.colorScheme.surface,
+            modifier = Modifier.fillMaxWidth().fillMaxHeight(0.82f),
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Chọn ảnh trong mục Ảnh", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                    IconButton(onClick = onDismiss) { Icon(Icons.Rounded.Close, "Đóng") }
+                }
+                when {
+                    loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                    photos.isEmpty() -> Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            "Chưa có ảnh nào được hiển thị trong mục Ảnh. Hãy chọn thư mục ảnh ở tab Ảnh trước.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    else -> LazyVerticalGrid(
+                        columns = GridCells.Adaptive(104.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(photos, key = { it.id }) { photo ->
+                            var thumbnail by remember(photo.id) { mutableStateOf<ImageBitmap?>(null) }
+                            LaunchedEffect(photo.id) {
+                                thumbnail = repository.thumbnail(photo)?.asImageBitmap()
+                            }
+                            Box(
+                                Modifier.fillMaxWidth().aspectRatio(0.82f)
+                                    .clip(MaterialTheme.shapes.medium)
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .clickable { onSelect(photo) },
+                            ) {
+                                thumbnail?.let {
+                                    Image(it, photo.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                }
+                                Text(
+                                    photo.name,
+                                    modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                                        .background(Color.Black.copy(alpha = 0.58f)).padding(6.dp),
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -197,7 +197,7 @@ private fun List<VideoItem>.sortedBy(mode: SortMode) = when (mode) {
     SortMode.LENGTH -> sortedByDescending { it.durationMs }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun LibraryScreen(vm: LibraryViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -425,14 +425,31 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                     // ─────────── Màn hình chính: danh sách thư mục ───────────
                     LazyVerticalGrid(
                         state = homeGrid,
-                        columns = if (gridMode) GridCells.Adaptive(150.dp) else GridCells.Fixed(1),
+                        columns = if (gridMode) GridCells.Adaptive(140.dp) else GridCells.Fixed(1),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = contentPadding,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(if (gridMode) 18.dp else 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(if (gridMode) 12.dp else 8.dp),
                     ) {
                         val hasVideos = state.videos.isNotEmpty()
-                        fullLine("header") {
+                        if (selectionMode && searching) {
+                            stickyHeader(key = "selection_header_search") {
+                                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(bottom = 8.dp)) {
+                                    SelectionHeader(
+                                        selectedCount = selectedIds.size,
+                                        totalCount = searchResults.size,
+                                        onClose = { selectionMode = false; selectedIds = emptySet() },
+                                        onSelectAll = {
+                                            val allSelected = searchResults.isNotEmpty() && searchResults.all { it.id in selectedIds }
+                                            selectedIds = if (allSelected) selectedIds - searchResults.map { it.id }.toSet()
+                                            else selectedIds + searchResults.map { it.id }.toSet()
+                                        },
+                                        onDelete = { confirmDeleteMulti = true },
+                                    )
+                                }
+                            }
+                        }
+                        if (!selectionMode || !searching) fullLine("header") {
                             if (selectionMode && searching) {
                                 SelectionHeader(
                                     selectedCount = selectedIds.size,
@@ -535,13 +552,30 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                 } else {
                     // ─────────── Bên trong một thư mục ───────────
                     LazyVerticalGrid(
-                        columns = if (gridMode) GridCells.Adaptive(164.dp) else GridCells.Fixed(1),
+                        columns = if (gridMode) GridCells.Adaptive(144.dp) else GridCells.Fixed(1),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = contentPadding,
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(if (gridMode) 14.dp else 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(if (gridMode) 10.dp else 8.dp),
                     ) {
-                        fullLine("header") {
+                        if (selectionMode) {
+                            stickyHeader(key = "selection_header_folder") {
+                                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(bottom = 8.dp)) {
+                                    SelectionHeader(
+                                        selectedCount = selectedIds.size,
+                                        totalCount = folderVideos.size,
+                                        onClose = { selectionMode = false; selectedIds = emptySet() },
+                                        onSelectAll = {
+                                            val allSelected = folderVideos.isNotEmpty() && folderVideos.all { it.id in selectedIds }
+                                            selectedIds = if (allSelected) selectedIds - folderVideos.map { it.id }.toSet()
+                                            else selectedIds + folderVideos.map { it.id }.toSet()
+                                        },
+                                        onDelete = { confirmDeleteMulti = true },
+                                    )
+                                }
+                            }
+                        }
+                        if (!selectionMode) fullLine("header") {
                             if (selectionMode) {
                                 SelectionHeader(
                                     selectedCount = selectedIds.size,
@@ -1141,7 +1175,7 @@ private fun VideoTile(
     Box(
         Modifier
             .fillMaxWidth()
-            .aspectRatio(0.82f)
+            .aspectRatio(0.9f)
             .clip(MaterialTheme.shapes.medium)
             .background(MaterialTheme.colorScheme.surfaceContainerHigh)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
@@ -1203,7 +1237,7 @@ private fun VideoTile(
                 Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(28.dp))
             }
         }
-        Column(Modifier.align(Alignment.BottomStart).padding(12.dp)) {
+        Column(Modifier.align(Alignment.BottomStart).padding(10.dp)) {
             Text(item.name, color = Color.White, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(2.dp))
             Text(
@@ -1233,12 +1267,12 @@ private fun VideoRow(
             .clip(MaterialTheme.shapes.medium)
             .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surfaceContainerLow)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-            .padding(8.dp),
+            .padding(6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
             Modifier
-                .width(128.dp)
+                .width(112.dp)
                 .aspectRatio(16f / 10f)
                 .clip(MaterialTheme.shapes.small)
                 .background(MaterialTheme.colorScheme.surfaceContainerHighest),
@@ -1246,10 +1280,10 @@ private fun VideoRow(
             Thumbnail(item, Modifier.fillMaxSize())
             if (item.durationMs > 0) DurationBadge(item.durationMs, Modifier.align(Alignment.BottomEnd).padding(6.dp))
         }
-        Spacer(Modifier.width(14.dp))
+        Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
-            Text(item.name, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Spacer(Modifier.height(4.dp))
+            Text(item.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(2.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(folderIcon(item.folder), null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.width(4.dp))
