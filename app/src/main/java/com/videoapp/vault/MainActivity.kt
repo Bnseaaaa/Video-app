@@ -3,6 +3,7 @@ package com.videoapp.vault
 import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.ClipData
 import android.content.Intent
 import android.content.IntentSender
 import android.content.pm.PackageManager
@@ -12,6 +13,8 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.text.format.DateFormat
 import android.text.format.Formatter
+import android.widget.Toast
+import java.io.File
 import android.util.LruCache
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -75,6 +78,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -84,12 +88,34 @@ class MainActivity : ComponentActivity() {
 
     private val vm: LibraryViewModel by viewModels()
     private val photoVm: PhotoViewModel by viewModels()
+    private var catalogImportRevision by mutableIntStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         StreakStore.init(this)
-        setContent { KhoVideoTheme { AppRoot(vm, photoVm) } }
+        receiveGachaCatalog(intent)
+        setContent { KhoVideoTheme { AppRoot(vm, photoVm, catalogImportRevision) } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        receiveGachaCatalog(intent)
+    }
+
+    private fun receiveGachaCatalog(incoming: Intent?) {
+        val json = GachaCatalogStore.readIncoming(this, incoming) ?: return
+        runCatching { GachaCatalogStore.importCatalog(this, json) }
+            .onSuccess { added ->
+                catalogImportRevision++
+                val message = if (added > 0) "Đã thêm $added video vào Gacha từ thiết bị kia"
+                else "Danh sách Gacha đã được cập nhật"
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            }
+            .onFailure {
+                Toast.makeText(this, "Không đọc được danh sách Gacha", Toast.LENGTH_LONG).show()
+            }
     }
 }
 
@@ -102,9 +128,12 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 
 /** Khung chính: thanh chuyển giữa mục Video và mục Ảnh (hai mục tách biệt, mỗi mục có thư mục, tìm kiếm riêng). */
 @Composable
-private fun AppRoot(vm: LibraryViewModel, photoVm: PhotoViewModel) {
+private fun AppRoot(vm: LibraryViewModel, photoVm: PhotoViewModel, catalogImportRevision: Int) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("kho_video", Context.MODE_PRIVATE) }
+    val transferVideos = rememberVideoTransfer(vm)
+    val remoteCatalog = remember(catalogImportRevision) { GachaCatalogStore.load(context) }
+    val remoteGachaVideos = remember(remoteCatalog) { remoteCatalog.map { it.toVideoItem() } }
     // Mở lại đúng mục lần trước đang dùng
     var tab by rememberSaveable { mutableStateOf(Tab.entries.getOrElse(prefs.getInt("tab", 0)) { Tab.VIDEO }) }
     val holder = rememberSaveableStateHolder()
@@ -128,7 +157,7 @@ private fun AppRoot(vm: LibraryViewModel, photoVm: PhotoViewModel) {
             // Giữ nguyên trạng thái từng mục (thư mục đang mở, ô tìm kiếm...) khi chuyển qua lại
             holder.SaveableStateProvider(tab.name) {
                 when (tab) {
-                    Tab.VIDEO -> LibraryScreen(vm)
+                    Tab.VIDEO -> LibraryScreen(vm, remoteGachaVideos, transferVideos)
                     Tab.PHOTO -> PhotoScreen(photoVm)
                 }
             }
@@ -199,7 +228,11 @@ private fun List<VideoItem>.sortedBy(mode: SortMode) = when (mode) {
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-private fun LibraryScreen(vm: LibraryViewModel) {
+private fun LibraryScreen(
+    vm: LibraryViewModel,
+    remoteGachaVideos: List<VideoItem>,
+    onTransfer: (List<VideoItem>) -> Unit,
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
@@ -214,6 +247,7 @@ private fun LibraryScreen(vm: LibraryViewModel) {
     var showWidgets by rememberSaveable { mutableStateOf(prefs.getBoolean("show_widgets", true)) }
     var selectionMode by rememberSaveable { mutableStateOf(false) }
     var selectedIds by rememberSaveable { mutableStateOf(setOf<String>()) }
+    var selectedFolderKeys by remember { mutableStateOf(emptySet<String>()) }
     LaunchedEffect(sort) { prefs.edit().putString("video_sort", sort.name).apply() }
     LaunchedEffect(folderSort) { prefs.edit().putString("folder_sort", folderSort.name).apply() }
     var singleDeleteFor by remember { mutableStateOf<VideoItem?>(null) }
@@ -315,9 +349,29 @@ private fun LibraryScreen(vm: LibraryViewModel) {
     }
 
     val visible = remember(state.videos) { state.videos.filterNot { it.hidden } }
+    val gachaAllVideos = remember(visible, remoteGachaVideos) { visible + remoteGachaVideos }
     val resumeId = prefs.getString("last_playback_id", null)
     val resumeItem = remember(state.videos, resumeId) { state.videos.firstOrNull { it.id == resumeId } }
     val resumePosition = resumeId?.let { prefs.getLong("playback_pos_$it", 0L) } ?: 0L
+    fun shareGachaVideos(items: List<VideoItem>) {
+        val selected = items.filter { it.remoteDevice == null }
+        if (selected.isEmpty()) return
+        runCatching {
+            val catalogJson = GachaCatalogStore.exportCatalog(context, selected, Build.MODEL ?: "Android")
+            val shareFile = File(context.cacheDir, "gacha-share-${System.currentTimeMillis()}.json")
+            shareFile.writeText(catalogJson, Charsets.UTF_8)
+            val shareUri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", shareFile)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = GachaCatalogStore.MIME_TYPE
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                clipData = ClipData.newUri(context.contentResolver, "Danh sách Gacha", shareUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(send, "Gửi danh sách video Gacha"))
+        }.onFailure {
+            Toast.makeText(context, "Không thể tạo danh sách chia sẻ", Toast.LENGTH_LONG).show()
+        }
+    }
     val hiddenVideos = remember(state.videos) { state.videos.filter { it.hidden } }
     val folders = remember(visible, folderSort) {
         visible.groupBy { it.folder }.map { (name, list) -> FolderInfo(name, name, list) }.let { list ->
@@ -340,8 +394,10 @@ private fun LibraryScreen(vm: LibraryViewModel) {
         if (openFolder != null && current == null && !state.loading) openFolder = null
     }
     val closeFolder = { openFolder = null; folderQuery = ""; selectionMode = false; selectedIds = emptySet() }
-    BackHandler(enabled = selectionMode || openFolder != null) {
-        if (selectionMode) {
+    BackHandler(enabled = selectedFolderKeys.isNotEmpty() || selectionMode || openFolder != null) {
+        if (selectedFolderKeys.isNotEmpty()) {
+            selectedFolderKeys = emptySet()
+        } else if (selectionMode) {
             selectionMode = false
             selectedIds = emptySet()
         } else {
@@ -349,6 +405,9 @@ private fun LibraryScreen(vm: LibraryViewModel) {
         }
     }
 
+    val selectableFolders = folders + listOfNotNull(hiddenFolder)
+    val selectedFolders = selectableFolders.filter { it.key in selectedFolderKeys }
+    val choosingFolders = selectedFolders.isNotEmpty()
     val searching = query.isNotBlank()
     val searchResults = remember(state.videos, query, sort) {
         // Tìm trong TOÀN BỘ video của máy, kể cả video đã ẩn
@@ -432,6 +491,26 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                         verticalArrangement = Arrangement.spacedBy(if (gridMode) 12.dp else 8.dp),
                     ) {
                         val hasVideos = state.videos.isNotEmpty()
+                        if (choosingFolders) {
+                            stickyHeader(key = "selection_header_folders") {
+                                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(bottom = 8.dp)) {
+                                    SelectionHeader(
+                                        selectedCount = selectedFolders.size,
+                                        totalCount = selectableFolders.size,
+                                        onClose = { selectedFolderKeys = emptySet() },
+                                        onSelectAll = {
+                                            selectedFolderKeys = if (selectedFolders.size == selectableFolders.size) {
+                                                emptySet()
+                                            } else {
+                                                selectableFolders.mapTo(mutableSetOf()) { it.key }
+                                            }
+                                        },
+                                        onShare = { shareGachaVideos(selectedFolders.flatMap { it.videos }.distinctBy { it.id }) },
+                                        selectedLabel = "Đã chọn ${selectedFolders.size} thư mục",
+                                    )
+                                }
+                            }
+                        }
                         if (selectionMode && searching) {
                             stickyHeader(key = "selection_header_search") {
                                 Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).padding(bottom = 8.dp)) {
@@ -444,12 +523,14 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                             selectedIds = if (allSelected) selectedIds - searchResults.map { it.id }.toSet()
                                             else selectedIds + searchResults.map { it.id }.toSet()
                                         },
+                                        onShare = { shareGachaVideos(state.videos.filter { it.id in selectedIds }) },
+                                        onTransfer = { onTransfer(state.videos.filter { it.id in selectedIds }) },
                                         onDelete = { confirmDeleteMulti = true },
                                     )
                                 }
                             }
                         }
-                        if (!selectionMode || !searching) fullLine("header") {
+                        if (!choosingFolders && (!selectionMode || !searching)) fullLine("header") {
                             if (selectionMode && searching) {
                                 SelectionHeader(
                                     selectedCount = selectedIds.size,
@@ -460,7 +541,9 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                         selectedIds = if (allSelected) selectedIds - searchResults.map { it.id }.toSet()
                                         else selectedIds + searchResults.map { it.id }.toSet()
                                     },
-                                    onDelete = { confirmDeleteMulti = true },
+                                    onShare = { shareGachaVideos(state.videos.filter { it.id in selectedIds }) },
+                                    onTransfer = { onTransfer(state.videos.filter { it.id in selectedIds }) },
+                                        onDelete = { confirmDeleteMulti = true },
                                 )
                             } else if (searching) {
                                 Header(
@@ -514,15 +597,16 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                         if (access == Access.PARTIAL) {
                             fullLine("partial") { PartialAccessBanner(onAllowAll = requestAccess) }
                         }
-                        if (hasVideos) {
-                            if (showWidgets) fullLine("stats") { StatsCard(visible, folders.size) }
-                            if (!searching && showWidgets) {
-                                fullLine("gacha") {
-                                    GachaCard(visible, scopeLabel = "toàn bộ máy") { gachaScope = GACHA_ALL }
-                                }
+                        if (hasVideos && showWidgets) fullLine("stats") { StatsCard(visible, folders.size) }
+                        if (!searching && showWidgets && (hasVideos || remoteGachaVideos.isNotEmpty())) {
+                            fullLine("gacha") {
+                                GachaCard(
+                                    gachaAllVideos,
+                                    scopeLabel = if (remoteGachaVideos.isEmpty()) "toàn bộ máy" else "Gacha chung",
+                                ) { gachaScope = GACHA_ALL }
                             }
-                            fullLine("search") { SearchField(query, "Tìm video trong toàn bộ máy") { query = it } }
                         }
+                        if (hasVideos && !choosingFolders) fullLine("search") { SearchField(query, "Tìm video trong toàn bộ máy") { query = it } }
                         when {
                             state.loading -> fullLine("loading") {
                                 Box(Modifier.fillMaxWidth().padding(top = 80.dp), Alignment.Center) { CircularProgressIndicator() }
@@ -534,15 +618,21 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                 items(searchResults, key = { it.id }) { VideoItemCell(it, Modifier.animateItem()) }
                             }
                             else -> {
-                                items(folders, key = { "folder:" + it.key }) { f ->
-                                    Box(Modifier.animateItem()) {
-                                        if (gridMode) FolderTile(f) { openFolder = f.key } else FolderRow(f) { openFolder = f.key }
+                                items(selectableFolders, key = { "folder:" + it.key }) { folder ->
+                                    val selected = folder.key in selectedFolderKeys
+                                    val toggle = {
+                                        selectedFolderKeys = if (selected) selectedFolderKeys - folder.key
+                                        else selectedFolderKeys + folder.key
                                     }
-                                }
-                                hiddenFolder?.let { f ->
-                                    item(key = "folder:hidden") {
-                                        Box(Modifier.animateItem()) {
-                                            if (gridMode) FolderTile(f) { openFolder = f.key } else FolderRow(f) { openFolder = f.key }
+                                    val onClick = { if (choosingFolders) toggle() else openFolder = folder.key }
+                                    val onShare: (() -> Unit)? = if (choosingFolders) null else {
+                                        { shareGachaVideos(folder.videos) }
+                                    }
+                                    Box(Modifier.animateItem()) {
+                                        if (gridMode) {
+                                            FolderTile(folder, selected, onShare, toggle, onClick)
+                                        } else {
+                                            FolderRow(folder, selected, onShare, toggle, onClick)
                                         }
                                     }
                                 }
@@ -570,6 +660,8 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                             selectedIds = if (allSelected) selectedIds - folderVideos.map { it.id }.toSet()
                                             else selectedIds + folderVideos.map { it.id }.toSet()
                                         },
+                                        onShare = { shareGachaVideos(state.videos.filter { it.id in selectedIds }) },
+                                        onTransfer = { onTransfer(state.videos.filter { it.id in selectedIds }) },
                                         onDelete = { confirmDeleteMulti = true },
                                     )
                                 }
@@ -586,7 +678,9 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                                         selectedIds = if (allSelected) selectedIds - folderVideos.map { it.id }.toSet()
                                         else selectedIds + folderVideos.map { it.id }.toSet()
                                     },
-                                    onDelete = { confirmDeleteMulti = true },
+                                    onShare = { shareGachaVideos(state.videos.filter { it.id in selectedIds }) },
+                                    onTransfer = { onTransfer(state.videos.filter { it.id in selectedIds }) },
+                                        onDelete = { confirmDeleteMulti = true },
                                 )
                             } else {
                                 Header(
@@ -640,14 +734,19 @@ private fun LibraryScreen(vm: LibraryViewModel) {
 
         gachaScope?.let { scope ->
             val pool = when (scope) {
-                GACHA_ALL -> visible
+                GACHA_ALL -> gachaAllVideos
                 FILTER_HIDDEN -> hiddenVideos
                 else -> visible.filter { it.folder == scope }
             }
             GachaDialog(
                 title = if (scope == GACHA_ALL) "Gacha toàn bộ máy" else "Gacha · ${if (scope == FILTER_HIDDEN) "Đã ẩn" else scope}",
                 pool = pool,
-                onPlay = { play(it, listOf(it)); gachaScope = null },
+                onPlay = { item ->
+                    if (item.remoteDevice == null) {
+                        play(item, listOf(item))
+                        gachaScope = null
+                    }
+                },
                 onResetRound = { vm.resetWatched(pool) },
                 onDismiss = { gachaScope = null },
             )
@@ -659,6 +758,7 @@ private fun LibraryScreen(vm: LibraryViewModel) {
                 onDismiss = { sheetFor = null },
                 onPlay = { play(item) },
                 onRename = { renameFor = item },
+                onTransfer = { onTransfer(listOf(item)) },
                 onDelete = { singleDeleteFor = item },
                 onToggleHidden = { vm.setHidden(item, !item.hidden) },
                 onExport = { export(item) },
@@ -764,7 +864,10 @@ private fun SelectionHeader(
     totalCount: Int,
     onClose: () -> Unit,
     onSelectAll: () -> Unit,
-    onDelete: () -> Unit,
+    onShare: () -> Unit,
+    onDelete: (() -> Unit)? = null,
+    selectedLabel: String? = null,
+    onTransfer: (() -> Unit)? = null,
 ) {
     Row(
         Modifier
@@ -778,7 +881,7 @@ private fun SelectionHeader(
             Icon(Icons.Rounded.Close, "Huỷ chọn")
         }
         Text(
-            "Đã chọn $selectedCount",
+            selectedLabel ?: "Đã chọn $selectedCount",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.weight(1f).padding(start = 4.dp),
@@ -787,16 +890,31 @@ private fun SelectionHeader(
             Text(if (selectedCount == totalCount && totalCount > 0) "Bỏ chọn" else "Tất cả")
         }
         FilledTonalIconButton(
-            onClick = onDelete,
+            onClick = onShare,
             enabled = selectedCount > 0,
-            colors = IconButtonDefaults.filledTonalIconButtonColors(
-                containerColor = MaterialTheme.colorScheme.errorContainer,
-                contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                disabledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
-                disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
-            ),
+            modifier = Modifier.size(40.dp),
         ) {
-            Icon(Icons.Rounded.DeleteOutline, "Xoá đã chọn")
+            Icon(Icons.Rounded.Bluetooth, "Gửi danh sách Gacha qua Bluetooth")
+        }
+        if (onTransfer != null) {
+            IconButton(onClick = onTransfer, enabled = selectedCount > 0) {
+                Icon(Icons.Rounded.FolderOpen, "Di chuyển hoặc sao chép video")
+            }
+        }
+        if (onDelete != null) {
+            Spacer(Modifier.width(4.dp))
+            FilledTonalIconButton(
+                onClick = onDelete,
+                enabled = selectedCount > 0,
+                colors = IconButtonDefaults.filledTonalIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                ),
+            ) {
+                Icon(Icons.Rounded.DeleteOutline, "Xoá đã chọn")
+            }
         }
     }
 }
@@ -1057,11 +1175,18 @@ private fun SearchSummary(found: Int, total: Int) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FolderTile(folder: FolderInfo, onClick: () -> Unit) {
+private fun FolderTile(
+    folder: FolderInfo,
+    selected: Boolean,
+    onShare: (() -> Unit)?,
+    onLongClick: () -> Unit,
+    onClick: () -> Unit,
+) {
     val context = LocalContext.current
     val hidden = folder.key == FILTER_HIDDEN
-    Column(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).clickable(onClick = onClick)) {
+    Column(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).combinedClickable(onClick = onClick, onLongClick = onLongClick)) {
         Box(
             Modifier
                 .fillMaxWidth()
@@ -1090,6 +1215,9 @@ private fun FolderTile(folder: FolderInfo, onClick: () -> Unit) {
                     null, tint = Color.White, modifier = Modifier.size(18.dp),
                 )
             }
+            Box(Modifier.align(Alignment.TopEnd).padding(4.dp)) {
+                FolderShareOrSelected(selected, onShare)
+            }
             Text(
                 "${folder.count}",
                 color = Color.White,
@@ -1115,8 +1243,15 @@ private fun FolderTile(folder: FolderInfo, onClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FolderRow(folder: FolderInfo, onClick: () -> Unit) {
+private fun FolderRow(
+    folder: FolderInfo,
+    selected: Boolean,
+    onShare: (() -> Unit)?,
+    onLongClick: () -> Unit,
+    onClick: () -> Unit,
+) {
     val context = LocalContext.current
     val hidden = folder.key == FILTER_HIDDEN
     Row(
@@ -1124,7 +1259,7 @@ private fun FolderRow(folder: FolderInfo, onClick: () -> Unit) {
             .fillMaxWidth()
             .clip(MaterialTheme.shapes.medium)
             .background(MaterialTheme.colorScheme.surfaceContainerLow)
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1146,7 +1281,30 @@ private fun FolderRow(folder: FolderInfo, onClick: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        FolderShareOrSelected(selected, onShare)
+        if (onShare != null) {
+            Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun FolderShareOrSelected(selected: Boolean, onShare: (() -> Unit)?) {
+    when {
+        onShare != null -> FilledTonalIconButton(onClick = onShare) {
+            Icon(Icons.Rounded.Bluetooth, "Gửi cả thư mục qua Bluetooth")
+        }
+        selected -> Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.primaryContainer,
+            modifier = Modifier.padding(6.dp),
+        ) {
+            Icon(
+                Icons.Rounded.Check,
+                "Đã chọn",
+                modifier = Modifier.padding(8.dp).size(20.dp),
+            )
+        }
     }
 }
 
@@ -1439,6 +1597,7 @@ private fun ActionSheet(
     onDelete: () -> Unit,
     onToggleHidden: () -> Unit,
     onExport: () -> Unit,
+    onTransfer: () -> Unit,
     onDeleteLegacy: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -1474,6 +1633,7 @@ private fun ActionSheet(
             val act = { f: () -> Unit -> { onDismiss(); f() } }
             SheetAction(Icons.Rounded.PlayArrow, "Phát video", onClick = act(onPlay))
             SheetAction(Icons.Rounded.Edit, "Đổi tên", "Chỉ đổi tên trong app, file gốc giữ nguyên", onClick = act(onRename))
+            SheetAction(Icons.Rounded.FolderOpen, "Di chuyển hoặc sao chép", onClick = act(onTransfer))
             if (item.localFile != null) {
                 SheetAction(Icons.Rounded.SaveAlt, "Lưu ra Thư viện", "Bản sao trong Movies/KhoVideo", onClick = act(onExport))
                 SheetAction(Icons.Rounded.DeleteOutline, "Xoá bản chép", "Bản chép trong app từ phiên bản 1.0", danger = true, onClick = act(onDeleteLegacy))

@@ -36,6 +36,8 @@ data class VideoItem(
     val localFile: File? = null,
     /** Tên file gốc (kể cả khi đã đổi tên trong app). */
     val fileName: String = "",
+    /** Tên máy gửi mục này qua Bluetooth; mục từ xa chỉ dùng trong Gacha. */
+    val remoteDevice: String? = null,
 ) {
     /** Chuỗi dùng để tìm kiếm: gồm tên hiển thị + tên file, đã bỏ dấu và viết thường. */
     val searchKey: String = "$name $fileName".toSearchKey()

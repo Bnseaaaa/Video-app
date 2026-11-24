@@ -73,8 +73,8 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -159,8 +159,8 @@ class PlayerActivity : ComponentActivity() {
         frameCache.get(ms) ?: runCatching {
             val r = retriever ?: return@runCatching null
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST, PREVIEW_PX, PREVIEW_PX)
-                    ?: r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, PREVIEW_PX, PREVIEW_PX)
+                r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, PREVIEW_PX, PREVIEW_PX)
+                    ?: r.getScaledFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST, PREVIEW_PX, PREVIEW_PX)
                     ?: r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: r.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST)
             } else {
@@ -270,7 +270,10 @@ class PlayerActivity : ComponentActivity() {
             setShutterBackgroundColor(android.graphics.Color.BLACK)
         }
 
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        if (android.os.Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).isAppearanceLightNavigationBars = false
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -341,6 +344,27 @@ class PlayerActivity : ComponentActivity() {
         load(0, true)
     }
 
+    private fun seekFromGesture(targetMs: Long): Long? {
+        val p = player ?: return null
+        val durationMs = p.duration
+        if (!p.isCurrentMediaItemSeekable || durationMs <= 0L) return null
+
+        val target = targetMs.coerceIn(0L, durationMs)
+        // Seek directly to a decodable frame for gestures. Keep the ends of the
+        // timeline exact, including a seek to the end to finish playback.
+        if (target > 0L && target < durationMs) {
+            p.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+            try {
+                p.seekTo(target)
+            } finally {
+                p.setSeekParameters(SeekParameters.EXACT)
+            }
+        } else {
+            p.seekTo(target)
+        }
+        return p.currentPosition
+    }
+
     private fun seekBy(ms: Long) {
         val p = player ?: return
         val dur = p.duration.takeIf { it > 0 } ?: Long.MAX_VALUE
@@ -392,6 +416,7 @@ class PlayerActivity : ComponentActivity() {
         var splitAutoPlay by rememberSaveable { mutableStateOf(prefs.getBoolean("player_split_auto_play", false)) }
         var splitAreaHeightPx by remember { mutableIntStateOf(0) }
         var splitImageUri by rememberSaveable { mutableStateOf(prefs.getString("player_split_image", null)) }
+        var splitFolderKey by rememberSaveable { mutableStateOf(prefs.getString("player_split_folder", null)) }
         var splitImage by remember { mutableStateOf<ImageBitmap?>(null) }
         val photoRepo = remember(context) { PhotoRepository(context) }
         var showSplitPhotoPicker by remember { mutableStateOf(false) }
@@ -407,25 +432,56 @@ class PlayerActivity : ComponentActivity() {
                 splitPickerLoading = false
             }
         }
-        val selectedSplitPhotoIndex = splitPickerPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
-        val splitPagerState = rememberPagerState(
-            initialPage = selectedSplitPhotoIndex.coerceAtLeast(0),
-        ) { splitPickerPhotos.size }
-        LaunchedEffect(splitImageUri, splitPickerPhotos) {
-            val target = splitPickerPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
-            if (target >= 0 && target != splitPagerState.currentPage) splitPagerState.scrollToPage(target)
+        val splitFolders = remember(splitPickerPhotos) {
+            splitPickerPhotos.groupBy { it.dirKey }.values
+                .map { folder -> folder.sortedByDescending { it.takenAt } }
+                .sortedByDescending { it.firstOrNull()?.takenAt ?: 0L }
         }
-        LaunchedEffect(splitAutoPlay, splitMode, splitPagerState.currentPage, splitPickerPhotos.size) {
-            if (splitAutoPlay && splitMode && splitPickerPhotos.size > 1) {
-                delay(3_000)
-                val next = (splitPagerState.currentPage + 1) % splitPickerPhotos.size
-                splitPagerState.animateScrollToPage(next)
+        LaunchedEffect(splitFolders, splitImageUri, splitFolderKey) {
+            if (splitFolders.isNotEmpty()) {
+                val validKeys = splitFolders.mapNotNull { it.firstOrNull()?.dirKey }.toSet()
+                val uriFolder = splitPickerPhotos.firstOrNull { it.uri.toString() == splitImageUri }?.dirKey
+                val savedFolderKey = splitFolderKey
+                val chosenKey = when {
+                    savedFolderKey != null && savedFolderKey in validKeys -> savedFolderKey
+                    uriFolder != null && uriFolder in validKeys -> uriFolder
+                    else -> splitFolders.first().first().dirKey
+                }
+                if (chosenKey != splitFolderKey) {
+                    splitFolderKey = chosenKey
+                    prefs.edit().putString("player_split_folder", chosenKey).apply()
+                }
             }
         }
-        LaunchedEffect(splitPagerState.currentPage, splitPickerPhotos) {
-            val photo = splitPickerPhotos.getOrNull(splitPagerState.currentPage) ?: return@LaunchedEffect
-            val selectedIndex = splitPickerPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
-            if (!splitPagerState.isScrollInProgress && (selectedIndex < 0 || selectedIndex != splitPagerState.currentPage)) {
+        val splitFolderPhotos = remember(splitPickerPhotos, splitFolderKey) {
+            splitPickerPhotos.filter { it.dirKey == splitFolderKey }.sortedByDescending { it.takenAt }
+        }
+        val selectedSplitPhotoIndex = splitFolderPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
+        val splitPagerState = rememberPagerState(
+            initialPage = selectedSplitPhotoIndex.coerceAtLeast(0),
+        ) { splitFolderPhotos.size }
+        LaunchedEffect(splitImageUri, splitFolderPhotos) {
+            val target = splitFolderPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
+            if (target >= 0 && target != splitPagerState.currentPage) {
+                splitPagerState.scrollToPage(target)
+            } else if (target < 0 && splitFolderPhotos.isNotEmpty()) {
+                splitPagerState.scrollToPage(0)
+                val first = splitFolderPhotos.first()
+                splitImageUri = first.uri.toString()
+                prefs.edit().putString("player_split_image", splitImageUri).apply()
+            }
+        }
+        LaunchedEffect(splitAutoPlay, splitMode, splitPagerState.currentPage, splitFolderPhotos.size) {
+            if (splitAutoPlay && splitMode && splitFolderPhotos.size > 1) {
+                delay(3_000)
+                val next = (splitPagerState.currentPage + 1) % splitFolderPhotos.size
+                splitPagerState.scrollToPage(next)
+            }
+        }
+        LaunchedEffect(splitPagerState.currentPage, splitFolderPhotos) {
+            val photo = splitFolderPhotos.getOrNull(splitPagerState.currentPage) ?: return@LaunchedEffect
+            val selectedIndex = splitFolderPhotos.indexOfFirst { it.uri.toString() == splitImageUri }
+            if (!splitPagerState.isScrollInProgress && selectedIndex >= 0 && selectedIndex != splitPagerState.currentPage) {
                 return@LaunchedEffect
             }
             if (photo.uri.toString() != splitImageUri) {
@@ -454,13 +510,10 @@ class PlayerActivity : ComponentActivity() {
         var dur by remember { mutableLongStateOf(0L) }
         var seeking by remember { mutableStateOf<Float?>(null) }
         var wasPlayingBeforeSeek by remember { mutableStateOf(false) }
-        var lastSeekPreviewAt by remember { mutableLongStateOf(0L) }
         var touched by remember { mutableIntStateOf(0) }   // tăng mỗi lần bấm nút → đếm lại thời gian tự ẩn
         var flash by remember { mutableStateOf<String?>(null) }  // chữ "« 5 giây" / "5 giây »" ở giữa màn hình
         var fast by remember { mutableStateOf(false) }  // đang giữ màn hình để tua nhanh
         var preview by remember { mutableStateOf<ImageBitmap?>(null) }  // khung hình xem trước khi kéo thanh tua
-        var seekFrameTarget by remember { mutableStateOf<Long?>(null) }
-        var thumbnailPreview by remember { mutableStateOf<ImageBitmap?>(null) }
         var isSwiping by remember { mutableStateOf(false) }
         var swipeTargetPos by remember { mutableLongStateOf(0L) }
         var swipeDeltaSec by remember { mutableLongStateOf(0L) }
@@ -473,33 +526,28 @@ class PlayerActivity : ComponentActivity() {
                 resumeFlash = null
             }
         }
-        // Trong lúc kéo, lấy khung mới nhất theo nhịp; bỏ qua các vị trí cũ nếu giải mã chưa xong.
-        LaunchedEffect(index) {
+        val previewActive = seeking != null || isSwiping
+        LaunchedEffect(previewActive, index) {
             preview = null
-            // Show the system-generated video thumbnail while an exact seek frame is being decoded.
-            val fallback = runCatching { VideoRepository(this@PlayerActivity).thumbnail(queue[index]) }.getOrNull()
-            thumbnailPreview = fallback?.asImageBitmap()
-        }
-        LaunchedEffect(seeking == null, thumbnailPreview) {
-            if (seeking == null && seekFrameTarget == null) preview = null else if (preview == null) preview = thumbnailPreview
-        }
-        LaunchedEffect(seekFrameTarget, index) {
-            val target = seekFrameTarget ?: return@LaunchedEffect
-            val bitmap = frameAt(queue[index].uri, target)
-            if (seekFrameTarget == target && bitmap != null) preview = bitmap.asImageBitmap()
-            delay(700)
-            if (seekFrameTarget == target) { seekFrameTarget = null; preview = null }
-        }
-        LaunchedEffect(isSwiping, index) {
-            if (isSwiping) {
-                while (isSwiping) {
-                    val target = swipeTargetPos
-                    val sampled = target / 500L * 500L
-                    frameAt(queue[index].uri, sampled)?.let { bitmap ->
-                        if (isSwiping && swipeTargetPos == target) preview = bitmap.asImageBitmap()
+            var lastSample = -1L
+            while (seeking != null || isSwiping) {
+                val target = seeking?.let { (it * dur).toLong() } ?: swipeTargetPos
+                val sample = target / 300L * 300L
+                if (dur > 0L && sample != lastSample) {
+                    lastSample = sample
+                    frameAt(queue[index].uri, sample)?.let { bitmap ->
+                        if (seeking != null || isSwiping) preview = bitmap.asImageBitmap()
                     }
-                    delay(160)
                 }
+                delay(50)
+            }
+        }
+        var showBuffering by remember { mutableStateOf(false) }
+        LaunchedEffect(buffering, previewActive) {
+            showBuffering = false
+            if (buffering && !previewActive) {
+                delay(350)
+                showBuffering = true
             }
         }
         val p = player
@@ -602,16 +650,21 @@ class PlayerActivity : ComponentActivity() {
                                     } while (event.changes.any { it.pressed })
                                 }
                             }
-                            .background(Color(0xFF111111)),
+                            .background(Color(0xFF111111))
+                            .pointerInput(splitImageZoom) {
+                                detectTapGestures(onDoubleTap = {
+                                    splitImageZoom = if (splitImageZoom > 1.01f) 1f else 2f
+                                })
+                            },
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (splitPickerPhotos.isNotEmpty() && selectedSplitPhotoIndex >= 0) {
+                        if (splitFolderPhotos.isNotEmpty()) {
                             HorizontalPager(
                                 state = splitPagerState,
                                 modifier = Modifier.fillMaxSize(),
                             ) { page ->
                                 SplitPhotoPage(
-                                    photo = splitPickerPhotos[page],
+                                    photo = splitFolderPhotos[page],
                                     repository = photoRepo,
                                     zoom = splitImageZoom,
                                     modifier = Modifier.fillMaxSize(),
@@ -631,15 +684,15 @@ class PlayerActivity : ComponentActivity() {
                             TextButton(onClick = { showSplitPhotoPicker = true }) {
                                 Icon(Icons.Rounded.AddPhotoAlternate, null)
                                 Spacer(Modifier.width(8.dp))
-                                Text("Chọn ảnh trong mục Ảnh")
+                                Text("Chọn thư mục ảnh trong mục Ảnh")
                             }
                         }
                         Row(
-                            Modifier.align(Alignment.BottomEnd).padding(6.dp)
+                            Modifier.align(Alignment.TopEnd).padding(8.dp)
                                 .clip(CircleShape).background(Color.Black.copy(alpha = 0.55f)),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            if (splitPickerPhotos.size > 1 && selectedSplitPhotoIndex >= 0) {
+                            if (splitFolderPhotos.size > 1 && selectedSplitPhotoIndex >= 0) {
                                 IconButton(
                                     onClick = {
                                         splitAutoPlay = !splitAutoPlay
@@ -653,13 +706,21 @@ class PlayerActivity : ComponentActivity() {
                                     )
                                 }
                             }
-                            TextButton(onClick = { showSplitPhotoPicker = true }) { Text("Đổi ảnh", color = Color.White) }
+                            TextButton(onClick = { showSplitPhotoPicker = true }) { Text("Đổi thư mục", color = Color.White) }
                         }
                     }
                 }
             }
             // Vuốt ngang màn hình để tua live trên màn hình lớn; chạm/nhấp đúp 5s/giữ 2x
-            if ((seekFrameTarget != null || isSwiping) && preview != null) {
+            if (splitMode) {
+                Box(
+                    Modifier.align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .windowInsetsBottomHeight(WindowInsets.navigationBars)
+                        .background(Color.Black),
+                )
+            }
+            if (previewActive && preview != null) {
                 Image(
                     bitmap = preview!!,
                     contentDescription = null,
@@ -712,7 +773,6 @@ class PlayerActivity : ComponentActivity() {
                                 isSwiping = true
                                 swipeTargetPos = startPos
                                 swipeDeltaSec = 0L
-                                seekFrameTarget = null
                                 preview = null
                             },
                             onHorizontalDrag = { change, dragAmount ->
@@ -727,9 +787,8 @@ class PlayerActivity : ComponentActivity() {
                             },
                             onDragEnd = {
                                 isSwiping = false
-                                player?.seekTo(swipeTargetPos)
-                                pos = swipeTargetPos
-                                seekFrameTarget = swipeTargetPos / 500L * 500L
+                                preview = null
+                                seekFromGesture(swipeTargetPos)?.let { pos = it }
                                 touched++
                             },
                             onDragCancel = {
@@ -746,7 +805,6 @@ class PlayerActivity : ComponentActivity() {
                                     val isRight = offset.x >= screenWidth / 2
                                     val delta = if (isRight) 5_000L else -5_000L
                                     seekBy(delta)
-                                    seekFrameTarget = player?.currentPosition
                                     touched++
                                 }
                             },
@@ -792,13 +850,18 @@ class PlayerActivity : ComponentActivity() {
 
             if (showSplitPhotoPicker) {
                 SplitPhotoPicker(
-                    photos = splitPickerPhotos,
+                    folders = splitFolders,
                     loading = splitPickerLoading,
                     repository = photoRepo,
                     onSelect = { photo ->
+                        splitFolderKey = photo.dirKey
                         splitImageUri = photo.uri.toString()
                         splitImageZoom = 1f
-                        prefs.edit().putString("player_split_image", splitImageUri).putBoolean("player_split_mode", true).apply()
+                        prefs.edit()
+                            .putString("player_split_folder", splitFolderKey)
+                            .putString("player_split_image", splitImageUri)
+                            .putBoolean("player_split_mode", true)
+                            .apply()
                         splitMode = true
                         showSplitPhotoPicker = false
                     },
@@ -806,7 +869,7 @@ class PlayerActivity : ComponentActivity() {
                 )
             }
 
-            if (buffering && error == null && seeking == null && seekFrameTarget == null) {
+            if (buffering && showBuffering && error == null && !previewActive) {
                 CircularProgressIndicator(Modifier.align(Alignment.Center).size(48.dp), color = Color.White)
             }
             error?.let {
@@ -899,33 +962,29 @@ class PlayerActivity : ComponentActivity() {
                             fraction = fraction,
                             onChange = { value ->
                                 if (seeking == null) {
-                                    seekFrameTarget = null
-                                    wasPlayingBeforeSeek = player?.isPlaying == true
+                                    preview = null
+                                    wasPlayingBeforeSeek = player?.playWhenReady == true
                                     if (wasPlayingBeforeSeek) player?.pause()
-                                    lastSeekPreviewAt = 0L
-                                    player?.setSeekParameters(SeekParameters.CLOSEST_SYNC)
                                 }
                                 seeking = value
-                                val now = SystemClock.elapsedRealtime()
-                                if (now - lastSeekPreviewAt >= 160L) {
-                                    player?.seekTo((value * dur).toLong())
-                                    lastSeekPreviewAt = now
-                                }
                             },
                             onDone = { f ->
                                 val target = (f * dur).toLong()
-                                seekFrameTarget = target / 500L * 500L
-                                player?.setSeekParameters(SeekParameters.EXACT)
-                                player?.seekTo(target)
-                                pos = target
+                                seekFromGesture(target)?.let { pos = it }
                                 seeking = null
+                                preview = null
                                 if (wasPlayingBeforeSeek) player?.play()
                                 wasPlayingBeforeSeek = false
                                 touched++
                             },
+                            onCancel = {
+                                seeking = null
+                                preview = null
+                                if (wasPlayingBeforeSeek) player?.play()
+                                wasPlayingBeforeSeek = false
+                            },
                             modifier = Modifier.align(Alignment.BottomCenter),
                         )
-                        // Ô xem trước nằm ngay trên nút tròn, chạy theo ngón tay
                     }
                     Row(Modifier.fillMaxWidth().padding(horizontal = 2.dp)) {
                         val shownPos = seeking?.let { (it * dur).toLong() } ?: pos
@@ -941,7 +1000,7 @@ class PlayerActivity : ComponentActivity() {
                     ) {
                         CtrlButton(Icons.Rounded.LockOpen, "Khoá màn hình") { locked = true; showUnlock = true }
                         CtrlButton(Icons.Rounded.SkipPrevious, "Video trước", enabled = index > 0) { act { go(-1) } }
-                        CtrlButton(Icons.Rounded.Replay5, "Lùi 5 giây") { act { seekBy(-5_000); seekFrameTarget = player?.currentPosition } }
+                        CtrlButton(Icons.Rounded.Replay5, "Lùi 5 giây") { act { seekBy(-5_000) } }
                         IconButton(onClick = { act { togglePlay() } }, modifier = Modifier.size(64.dp)) {
                             Icon(
                                 when {
@@ -954,7 +1013,7 @@ class PlayerActivity : ComponentActivity() {
                                 modifier = Modifier.size(56.dp),
                             )
                         }
-                        CtrlButton(Icons.Rounded.Forward5, "Tới 5 giây") { act { seekBy(5_000); seekFrameTarget = player?.currentPosition } }
+                        CtrlButton(Icons.Rounded.Forward5, "Tới 5 giây") { act { seekBy(5_000) } }
                         CtrlButton(Icons.Rounded.SkipNext, "Video sau", enabled = index < queue.lastIndex) { act { go(1) } }
                         CtrlButton(Icons.Rounded.ScreenRotation, "Xoay màn hình") { act { toggleOrientation() } }
                     }
@@ -1048,12 +1107,18 @@ class PlayerActivity : ComponentActivity() {
 
     /** Thanh tua: vạch mảnh màu trắng + nút tròn trắng, chạm hoặc kéo để tua. */
     @Composable
-    private fun SeekBar(fraction: Float, onChange: (Float) -> Unit, onDone: (Float) -> Unit, modifier: Modifier = Modifier) {
+    private fun SeekBar(
+        fraction: Float,
+        onChange: (Float) -> Unit,
+        onDone: (Float) -> Unit,
+        onCancel: () -> Unit,
+        modifier: Modifier = Modifier,
+    ) {
         var width by remember { mutableIntStateOf(1) }
         var dragging by remember { mutableStateOf(false) }
-        var current by remember { mutableFloatStateOf(0f) }
         val change by rememberUpdatedState(onChange)
         val done by rememberUpdatedState(onDone)
+        val cancel by rememberUpdatedState(onCancel)
         val thumb = SEEK_THUMB
         Box(
             modifier
@@ -1065,26 +1130,29 @@ class PlayerActivity : ComponentActivity() {
                     fun f(x: Float) = ((x - r) / (width - 2 * r)).coerceIn(0f, 1f)
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
-                        dragging = true
-                        current = f(down.position.x)
-                        change(current)
                         down.consume()
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
-                            current = f(pointer.position.x)
-                            change(current)
-                            val released = !pointer.pressed
-                            pointer.consume()
-                            if (released) {
-                                dragging = false
-                                done(current)
-                                break
+                        try {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (pointer.isConsumed) break
+                                val current = f(pointer.position.x)
+                                pointer.consume()
+                                if (!pointer.pressed) {
+                                    dragging = false
+                                    done(current)
+                                    break
+                                }
+                                if (dragging || kotlin.math.abs(pointer.position.x - down.position.x) >= viewConfiguration.touchSlop) {
+                                    dragging = true
+                                    change(current)
+                                }
                             }
-                        }
-                        if (dragging) {
-                            dragging = false
-                            done(current)
+                        } finally {
+                            if (dragging) {
+                                dragging = false
+                                cancel()
+                            }
                         }
                     }
                 },
@@ -1160,12 +1228,14 @@ private fun SplitPhotoPage(
 
 @Composable
 private fun SplitPhotoPicker(
-    photos: List<PhotoItem>,
+    folders: List<List<PhotoItem>>,
     loading: Boolean,
     repository: PhotoRepository,
     onSelect: (PhotoItem) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var activeFolderKey by remember { mutableStateOf<String?>(null) }
+    val activeFolder = folders.firstOrNull { it.firstOrNull()?.dirKey == activeFolderKey }
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = MaterialTheme.shapes.extraLarge,
@@ -1174,49 +1244,105 @@ private fun SplitPhotoPicker(
         ) {
             Column(Modifier.padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Chọn ảnh trong mục Ảnh", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                    if (activeFolder != null) {
+                        IconButton(onClick = { activeFolderKey = null }) {
+                            Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Chọn thư mục khác")
+                        }
+                    }
+                    Text(
+                        activeFolder?.firstOrNull()?.folder?.let { "Chọn ảnh · $it" } ?: "Chọn thư mục ảnh",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     IconButton(onClick = onDismiss) { Icon(Icons.Rounded.Close, "Đóng") }
                 }
                 when {
                     loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator()
                     }
-                    photos.isEmpty() -> Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
+                    folders.isEmpty() -> Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
                         Text(
-                            "Chưa có ảnh nào được hiển thị trong mục Ảnh. Hãy chọn thư mục ảnh ở tab Ảnh trước.",
+                            "Chưa có thư mục ảnh nào được hiển thị. Hãy chọn thư mục ở tab Ảnh trước.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    else -> LazyVerticalGrid(
-                        columns = GridCells.Adaptive(104.dp),
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        items(photos, key = { it.id }) { photo ->
-                            var thumbnail by remember(photo.id) { mutableStateOf<ImageBitmap?>(null) }
-                            LaunchedEffect(photo.id) {
-                                thumbnail = repository.thumbnail(photo)?.asImageBitmap()
-                            }
-                            Box(
-                                Modifier.fillMaxWidth().aspectRatio(0.82f)
-                                    .clip(MaterialTheme.shapes.medium)
-                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                                    .clickable { onSelect(photo) },
-                            ) {
-                                thumbnail?.let {
-                                    Image(it, photo.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    else -> {
+                        LazyVerticalGrid(
+                            columns = GridCells.Adaptive(136.dp),
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            if (activeFolder == null) {
+                                items(folders, key = { it.first().dirKey }) { folder ->
+                                    val cover = folder.first()
+                                    var thumbnail by remember(cover.id) { mutableStateOf<ImageBitmap?>(null) }
+                                    LaunchedEffect(cover.id) {
+                                        thumbnail = repository.thumbnail(cover)?.asImageBitmap()
+                                    }
+                                    Column(
+                                        Modifier.fillMaxWidth()
+                                            .clip(MaterialTheme.shapes.medium)
+                                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                            .clickable { activeFolderKey = cover.dirKey }
+                                            .padding(6.dp),
+                                    ) {
+                                        Box(
+                                            Modifier.fillMaxWidth().aspectRatio(1.15f)
+                                                .clip(MaterialTheme.shapes.small),
+                                        ) {
+                                            thumbnail?.let {
+                                                Image(it, cover.folder, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                            }
+                                        }
+                                        Text(
+                                            cover.folder,
+                                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            style = MaterialTheme.typography.titleSmall,
+                                        )
+                                        Text(
+                                            "${folder.size} ảnh",
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                    }
                                 }
-                                Text(
-                                    photo.name,
-                                    modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth()
-                                        .background(Color.Black.copy(alpha = 0.58f)).padding(6.dp),
-                                    color = Color.White,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.labelSmall,
-                                )
+                            } else {
+                                items(activeFolder, key = { it.id }) { photo ->
+                                    var thumbnail by remember(photo.id) { mutableStateOf<ImageBitmap?>(null) }
+                                    LaunchedEffect(photo.id) {
+                                        thumbnail = repository.thumbnail(photo)?.asImageBitmap()
+                                    }
+                                    Column(
+                                        Modifier.fillMaxWidth()
+                                            .clip(MaterialTheme.shapes.medium)
+                                            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                            .clickable { onSelect(photo) }
+                                            .padding(6.dp),
+                                    ) {
+                                        Box(
+                                            Modifier.fillMaxWidth().aspectRatio(1f)
+                                                .clip(MaterialTheme.shapes.small),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            thumbnail?.let {
+                                                Image(it, photo.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                                            } ?: CircularProgressIndicator(Modifier.size(24.dp))
+                                        }
+                                        Text(
+                                            photo.name,
+                                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

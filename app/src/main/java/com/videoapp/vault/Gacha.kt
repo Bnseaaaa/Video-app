@@ -170,7 +170,21 @@ fun GachaDialog(
                             MaterialTheme.shapes.large,
                         ),
                 ) {
-                    showing?.let { Thumbnail(it, Modifier.fillMaxSize()) }
+                    showing?.let { item ->
+                        if (item.remoteDevice == null) {
+                            Thumbnail(item, Modifier.fillMaxSize())
+                        } else {
+                            Column(
+                                Modifier.fillMaxSize().background(BrandGradient),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center,
+                            ) {
+                                Icon(Icons.Rounded.Bluetooth, null, tint = Color.White, modifier = Modifier.size(44.dp))
+                                Spacer(Modifier.height(8.dp))
+                                Text("Video từ ${item.remoteDevice}", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                            }
+                        }
+                    }
                     if (phase == Phase.SPINNING) {
                         Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.25f)))
                     }
@@ -230,15 +244,16 @@ fun GachaDialog(
                         Spacer(Modifier.width(6.dp))
                         Text("Quay lại")
                     }
+                    val remoteResult = result?.remoteDevice != null
                     Button(
-                        onClick = { result?.let(onPlay) },
-                        enabled = revealed,
+                        onClick = { if (!remoteResult) result?.let(onPlay) },
+                        enabled = revealed && !remoteResult,
                         modifier = Modifier.weight(1f).height(50.dp),
                         shape = CircleShape,
                     ) {
-                        Icon(Icons.Rounded.PlayArrow, null, Modifier.size(20.dp))
+                        Icon(if (remoteResult) Icons.Rounded.Bluetooth else Icons.Rounded.PlayArrow, null, Modifier.size(20.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Xem ngay")
+                        Text(if (remoteResult) "Ở máy khác" else "Xem ngay")
                     }
                 }
                 Spacer(Modifier.height(10.dp))
